@@ -21,6 +21,7 @@ use winrust_common as i18n;
 use winrust_common::style::{Style, pal, style, ui_face};
 mod fly;
 mod mixer;
+mod peek;
 use windows::{
     Win32::{
         Media::Audio::{Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender},
@@ -1590,6 +1591,7 @@ unsafe fn fs_update(hwnd: HWND) {
     if FULLSCREEN.swap(fs, Relaxed) != fs {
         if fs {
             fly::close_now();
+            peek::hide();
             hide_tip(hwnd);
         }
         bar_anim(hwnd);
@@ -2463,7 +2465,11 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 (Some(&w), true) => {
                     // like the Windows taskbar: the active app's button minimizes it, a minimized one restores, any other raises
                     let fg = GetForegroundWindow();
-                    if wins.contains(&fg) && IsIconic(fg) == 0 {
+                    if wins.len() > 1 && !wins.contains(&fg) {
+                        // several windows and none of them in front: which one? Show them and let the user pick
+                        let bar = BAR.load(Relaxed) as HWND;
+                        peek::show(h, tip_cx(&bar_layout(bar), h), &wins);
+                    } else if wins.contains(&fg) && IsIconic(fg) == 0 {
                         ShowWindow(fg, SW_MINIMIZE);
                     } else {
                         if IsIconic(w) != 0 {
@@ -2497,6 +2503,16 @@ unsafe fn min_rect(info: *mut ShellHookInfo, bar: HWND) {
     };
     let (top, x) = (bar_top() + sc(4), x + bar_x_w().0);
     (*info).rc = RECT { left: x, top, right: x + l.bw, bottom: top + bar_h() - sc(8) };
+}
+
+/// Shows the window previews of bar button `h`. false = it has no open windows (or is not an app button at all).
+unsafe fn peek_for(hwnd: HWND, h: i32) -> bool {
+    let wins = if h >= 1 { BTNS.with_borrow(|b| b.get(h as usize).map(|b| b.wins.clone())).unwrap_or_default() } else { vec![] };
+    if wins.is_empty() || DRAGB.get().is_some() {
+        return false;
+    }
+    peek::show(h, tip_cx(&bar_layout(hwnd), h), &wins);
+    true
 }
 
 /// Screen x of the middle of a bar element, for its tooltip and menus.
@@ -2554,7 +2570,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == 2 => {
             KillTimer(hwnd, 2);
             let h = HOT.get();
-            if h != NONE && !fly::any_open() {
+            // a running app shows its windows' previews; everything else a text tip
+            if h != NONE && !fly::any_open() && !peek_for(hwnd, h) {
                 show_tip(tip_text(h), tip_cx(&bar_layout(hwnd), h));
             }
         }
@@ -2610,7 +2627,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             TrackMouseEvent(&mut tme);
             if HOT.replace(h) != h {
                 hide_tip(hwnd);
-                if h != NONE {
+                if peek::is_open() && peek_for(hwnd, h) {
+                    // previews are up already: the next button's replace them at once, as on the Windows taskbar
+                } else if h != NONE {
                     SetTimer(hwnd, 2, 450, None);
                 }
                 InvalidateRect(hwnd, null(), 0);
@@ -2635,6 +2654,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let x = (lp & 0xffff) as i16 as i32;
             let h = hit(hwnd, x);
             hide_tip(hwnd);
+            peek::hide();
             if h != NONE {
                 press(h);
             }
@@ -2723,6 +2743,7 @@ fn main() {
         SHOWN.set(std::fs::read_to_string(appdata_file("topbar-tray.txt")).ok().map(|s| s.lines().map(str::to_string).collect()));
         load_pins();
         fly::init(GetModuleHandleW(null()));
+        peek::init(GetModuleHandleW(null()));
         thread::spawn(fly::load_apps);
         let hi = GetModuleHandleW(null());
         let class = wide("topbar");
