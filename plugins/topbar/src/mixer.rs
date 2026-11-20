@@ -3,7 +3,7 @@
 use super::*;
 use windows::Win32::{
     Foundation::PROPERTYKEY,
-    Media::Audio::{AudioSessionStateExpired, DEVICE_STATE_ACTIVE, Endpoints::IAudioMeterInformation, IAudioSessionControl2, IAudioSessionManager2, IMMDevice, ISimpleAudioVolume},
+    Media::Audio::{eCapture, AudioSessionStateExpired, DEVICE_STATE_ACTIVE, Endpoints::IAudioMeterInformation, IAudioSessionControl2, IAudioSessionManager2, IMMDevice, ISimpleAudioVolume},
     System::Com::{CoTaskMemFree, STGM_READ},
 };
 
@@ -29,6 +29,9 @@ thread_local! {
     pub static APPS: RefCell<Vec<App>> = const { RefCell::new(Vec::new()) };
     pub static DEVS: RefCell<Vec<Dev>> = const { RefCell::new(Vec::new()) };
     pub static MASTER_PEAK: Cell<f32> = const { Cell::new(0.0) };
+    pub static INS: RefCell<Vec<Dev>> = const { RefCell::new(Vec::new()) }; // active input devices (microphones)
+    pub static MIC_VOL: Cell<(i32, bool)> = const { Cell::new((-1, false)) }; // default microphone: (percent or -1 = none, muted)
+    static MIC: RefCell<Option<IAudioEndpointVolume>> = const { RefCell::new(None) };
     static MASTER: RefCell<Option<IAudioMeterInformation>> = const { RefCell::new(None) };
     static NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new()); // exe path -> display name
 }
@@ -156,6 +159,7 @@ pub unsafe fn read() {
         apps.sort_by(|a, b| (!a.key.is_empty(), a.name.to_lowercase()).cmp(&(!b.key.is_empty(), b.name.to_lowercase())));
         Ok((apps, devs, dev.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None).ok()))
     })();
+    read_mic();
     let (mut apps, devs, master) = r.unwrap_or_default();
     APPS.with_borrow(|old| apps.iter_mut().for_each(|a| a.peak = old.iter().find(|o| o.key == a.key).map_or(0.0, |o| o.peak)));
     APPS.set(apps);
@@ -163,8 +167,67 @@ pub unsafe fn read() {
     MASTER.set(master);
 }
 
+/// The input side: the active microphones and the default one's level. On its own, so a PC without speakers still gets it.
+unsafe fn read_mic() {
+    let r = (|| -> windows::core::Result<(Vec<Dev>, IAudioEndpointVolume)> {
+        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let dev = en.GetDefaultAudioEndpoint(eCapture, eConsole)?;
+        let def = dev_id(&dev);
+        let mut ins = Vec::new();
+        if let Ok(col) = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) {
+            for i in 0..col.GetCount().unwrap_or(0) {
+                if let Ok(d) = col.Item(i) {
+                    let id = dev_id(&d);
+                    ins.push(Dev { name: dev_name(&d), default: id == def, id });
+                }
+            }
+        }
+        Ok((ins, dev.Activate(CLSCTX_ALL, None)?))
+    })();
+    match r {
+        Ok((ins, ep)) => {
+            MIC_VOL.set(((ep.GetMasterVolumeLevelScalar().unwrap_or(0.0) * 100.0).round() as i32, ep.GetMute().is_ok_and(|m| m.as_bool())));
+            INS.set(ins);
+            MIC.set(Some(ep));
+        }
+        Err(_) => {
+            MIC_VOL.set((-1, false));
+            INS.set(Vec::new());
+            MIC.set(None);
+        }
+    }
+}
+
+/// Name of the default microphone ("" when there is none).
+pub fn mic_name() -> String {
+    INS.with_borrow(|d| d.iter().find(|d| d.default).map(|d| d.name.clone()).unwrap_or_default())
+}
+
+/// Sets the default microphone's level (0..100) and unmutes it.
+pub unsafe fn set_mic(v: i32) {
+    let v = v.clamp(0, 100);
+    MIC.with_borrow(|m| {
+        if let Some(e) = m {
+            let _ = e.SetMasterVolumeLevelScalar(v as f32 / 100.0, null());
+            let _ = e.SetMute(false, null());
+            MIC_VOL.set((v, false));
+        }
+    });
+}
+
+pub unsafe fn mute_mic() {
+    MIC.with_borrow(|m| {
+        if let Some(e) = m {
+            let (v, muted) = MIC_VOL.get();
+            let _ = e.SetMute(!muted, null());
+            MIC_VOL.set((v, !muted));
+        }
+    });
+}
+
 /// Forgets the sessions (the mixer closed): no COM objects are held while nobody looks.
 pub fn drop_all() {
+    MIC.set(None);
     APPS.set(Vec::new());
     MASTER.set(None);
     MASTER_PEAK.set(0.0);
@@ -221,10 +284,22 @@ pub unsafe fn mute_app(i: usize) {
 /// EarTrumpet or in the Windows sound flyout. Windows has no documented call for this: it goes through IPolicyConfig
 /// (the interface the Sound control panel itself uses), called by vtable slot because no header declares it.
 pub unsafe fn set_default(i: usize) {
+    if let Some(id) = DEVS.with_borrow(|d| d.get(i).map(|d| d.id.clone())) {
+        set_default_id(&id);
+    }
+}
+
+/// The same for input device `i`: the default microphone.
+pub unsafe fn set_default_in(i: usize) {
+    if let Some(id) = INS.with_borrow(|d| d.get(i).map(|d| d.id.clone())) {
+        set_default_id(&id);
+    }
+}
+
+unsafe fn set_default_id(id: &[u16]) {
     use std::ffi::c_void;
     const CLSID_POLICY_CONFIG: windows::core::GUID = windows::core::GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
     const IID_POLICY_CONFIG: windows::core::GUID = windows::core::GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
-    let Some(id) = DEVS.with_borrow(|d| d.get(i).map(|d| d.id.clone())) else { return };
     let Ok(unk) = CoCreateInstance::<_, windows::core::IUnknown>(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL) else { return };
     let mut p: *mut c_void = null_mut();
     if unk.query(&IID_POLICY_CONFIG, &mut p).is_err() || p.is_null() {

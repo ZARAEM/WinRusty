@@ -209,6 +209,8 @@ thread_local! {
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static GLIDE: RefCell<HashMap<isize, (f32, u64, bool)>> = RefCell::new(HashMap::new()); // where each button is drawn: (x, last update ms, moving)
     static DRAGB: Cell<Option<Drag>> = const { Cell::new(None) };
+    #[allow(clippy::type_complexity)]
+    static FDRAG: RefCell<Option<((HWND, u32, u32, u32), String)>> = const { RefCell::new(None) }; // icon held in the tray flyout: what a click sends, and its key
     static PROG: RefCell<HashMap<isize, (u32, f32)>> = RefCell::new(HashMap::new()); // taskbar progress per window: (TBPF_* state, 0..1)
     static ROW: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) }; // the app buttons' keys in the order they are shown (pins and windows mixed)
     static SPRING: Cell<(isize, u32)> = const { Cell::new((0, 0)) }; // button under a held mouse button that is not ours, and for how many polls
@@ -535,7 +537,7 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
             });
             if tip.is_empty() {
-                tip = if over.is_empty() { "No more icons".into() } else { "Middle click: move to the bar".into() };
+                tip = if over.is_empty() { "No more icons".into() } else { t!("Перетащите на панель, чтобы оставить там", "Drag onto the bar to keep it there").into() };
             }
             let mut tr = RECT { left: sc(10), top: r.bottom - sc(26), right: r.right - sc(10), bottom: r.bottom - sc(4) };
             DrawTextW(dc, wide(&tip).as_ptr(), -1, &mut tr, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
@@ -564,6 +566,10 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 if msg == WM_MBUTTONDOWN {
                     toggle_shown(&key);
                     InvalidateRect(hwnd, null(), 0);
+                } else if msg == WM_LBUTTONDOWN {
+                    // acts when the button comes up: until then the icon may be dragged down onto the bar
+                    FDRAG.set(Some((t, key)));
+                    SetCapture(hwnd);
                 } else {
                     ShowWindow(hwnd, SW_HIDE);
                     InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
@@ -572,7 +578,27 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             0
         }
+        WM_LBUTTONUP => {
+            if let Some((t, key)) = FDRAG.take() {
+                ReleaseCapture();
+                let bar = BAR.load(Relaxed) as HWND;
+                let (mut pt, mut br): (POINT, RECT) = (zeroed(), zeroed());
+                GetCursorPos(&mut pt);
+                GetWindowRect(bar, &mut br);
+                if pt.x >= br.left && pt.x < br.right && pt.y >= br.top && pt.y < br.bottom {
+                    toggle_shown(&key); // let go over the bar: the icon is kept there from now on
+                    InvalidateRect(hwnd, null(), 0);
+                    InvalidateRect(bar, null(), 0);
+                } else if cell_at(lp) >= 0 {
+                    ShowWindow(hwnd, SW_HIDE); // a plain click (or a drag that stayed inside): the icon's own action
+                    InvalidateRect(bar, null(), 0); // the bar's chevron turns with it
+                    tray_click(t, true);
+                }
+            }
+            0
+        }
         WM_ACTIVATE if wp & 0xffff == 0 => {
+            FDRAG.set(None);
             ShowWindow(hwnd, SW_HIDE);
             InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
             0
@@ -2298,12 +2324,53 @@ fn windows_ru(n: usize) -> String {
     format!("{n} {w}")
 }
 
+/// The extension Windows would look a recent item up by: "report.docx.lnk" (as the Recent folder names its shortcuts)
+/// -> ".docx". None for names without one.
+fn recent_ext(lnk_name: &str) -> Option<String> {
+    let stem = lnk_name.strip_suffix(".lnk").or_else(|| lnk_name.strip_suffix(".LNK"))?;
+    let (name, ext) = stem.rsplit_once('.')?;
+    (!name.is_empty() && !ext.is_empty() && !ext.contains(' ')).then(|| format!(".{}", ext.to_lowercase()))
+}
+
+/// The files opened lately that `exe` (lower-case path) is the default program for, newest first: the "Recent" part of
+/// a jump list. From the user's Recent folder and the file associations, both documented; the apps' own jump list
+/// stores (tasks, pinned items) are not read. At most `max` files that still exist: (file name, full path).
+unsafe fn recent_for(exe: &str, max: usize) -> Vec<(String, String)> {
+    if exe.is_empty() {
+        return vec![];
+    }
+    let mut lnks: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(appdata_file(r"Microsoft\Windows\Recent")).into_iter().flatten().flatten().filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path()))).collect();
+    lnks.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut opens: HashMap<String, bool> = HashMap::new(); // extension -> this app opens it
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (_, lnk) in lnks.into_iter().take(150) {
+        let Some(ext) = recent_ext(&lnk.file_name().unwrap_or_default().to_string_lossy()) else { continue };
+        let ours = *opens.entry(ext.clone()).or_insert_with(|| {
+            let (mut b, mut n) = ([0u16; 520], 520u32);
+            AssocQueryStringW(0, 2 /* ASSOCSTR_EXECUTABLE */, wide(&ext).as_ptr(), null(), b.as_mut_ptr(), &mut n) == 0 && String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(0)]).to_lowercase() == exe
+        });
+        if !ours {
+            continue;
+        }
+        let target = lnk_target(&wide(&lnk.to_string_lossy())); // the shortcut is loaded only for files of this app
+        let path = std::path::Path::new(&target);
+        if path.is_file() && !out.iter().any(|(_, p)| *p == target) {
+            out.push((lnk.file_stem().unwrap_or_default().to_string_lossy().to_string(), target)); // the shortcut keeps the name's capitals, the target is lower-case
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Right-click menu of an app button, like the Windows 11 jump list: the app on top, its windows (when there are several),
 /// open / pin / Start, then close and end process in red.
 unsafe fn app_menu(hwnd: HWND, h: i32) {
     #[derive(Clone, Copy)]
     enum A {
         Win(HWND),
+        File(usize), // a recent file, by index
         Open,
         Pin,
         Start,
@@ -2329,6 +2396,13 @@ unsafe fn app_menu(hwnd: HWND, h: i32) {
             let n = GetWindowTextW(w, b.as_mut_ptr(), 256).max(0) as usize;
             items.push((fly::MItem { icon: icon_of(w), ..fly::MItem::new(String::from_utf16_lossy(&b[..n])) }, A::Win(w)));
         }
+    }
+    // recent files of this app, as in a jump list
+    let app_exe = if exe.is_empty() { pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| x.target.clone()))).unwrap_or_default() } else { exe.clone() };
+    let recent = recent_for(&app_exe, 5);
+    for (i, (name, _)) in recent.iter().enumerate() {
+        let it = fly::MItem::new(name.clone());
+        items.push((if i == 0 && !items.is_empty() { it.sep() } else { it }, A::File(i)));
     }
     if !launch.is_empty() {
         let it = fly::MItem::new(if wins.is_empty() { t!("Открыть", "Open") } else { t!("Новое окно", "New window") });
@@ -2357,6 +2431,7 @@ unsafe fn app_menu(hwnd: HWND, h: i32) {
                 }
                 force_fg(w);
             }
+            Some(A::File(i)) => recent.get(i).into_iter().for_each(|(_, path)| open(&wide(path))),
             Some(A::Open) => open(&wide(&launch)),
             Some(A::Pin) => {
                 // by path, not by the index seen when the menu opened: PINS may have changed meanwhile
@@ -3191,6 +3266,16 @@ mod tests {
         use super::progress_frac;
         assert_eq!((progress_frac(0), progress_frac(0xFFFE), progress_frac(0x1_0000), progress_frac(-5)), (0.0, 1.0, 1.0, 0.0));
         assert!((progress_frac(0x7FFF) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn recent_item_extension() {
+        use super::recent_ext;
+        assert_eq!(recent_ext("Report.DOCX.lnk").as_deref(), Some(".docx"));
+        assert_eq!(recent_ext("archive.tar.gz.lnk").as_deref(), Some(".gz"));
+        assert_eq!(recent_ext("Downloads.lnk"), None); // a folder: no extension
+        assert_eq!(recent_ext("notes.txt"), None); // not a shortcut
+        assert_eq!(recent_ext("v1. final draft.lnk"), None); // a dot in a folder name is not an extension
     }
 
     #[test]
