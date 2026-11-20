@@ -10,6 +10,7 @@ use std::{
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
     Quick,
+    Mixer, // the volume icon: master + per-app levels and the output device
     Wifi,
     Cal,
     Start,
@@ -21,6 +22,9 @@ enum Act {
     VolSlide,
     BrightSlide,
     Mute,
+    AppVol(u8),  // mixer: the slider of app i
+    AppMute(u8), // mixer: its icon (click = mute)
+    Dev(u8),     // mixer: make output device i the default
     WifiSwitch,
     Tile(u8),
     WifiMore,
@@ -95,7 +99,7 @@ thread_local! {
     static ICONS: RefCell<HashMap<Vec<u16>, HICON>> = RefCell::new(HashMap::new()); // by path: the app list is reloaded and reordered
     static SEL: Cell<usize> = const { Cell::new(0) }; // Start: the row Enter opens (arrow keys move it)
     static OVER: Cell<Option<Act>> = const { Cell::new(None) };
-    static DRAG: Cell<u8> = const { Cell::new(0) }; // 0 none, 1 volume slider, 2 brightness slider
+    static DRAG: Cell<u8> = const { Cell::new(0) }; // 0 none, 1 volume slider, 2 brightness slider, 3 + i the mixer slider of app i
     static MENU_X: Cell<i32> = const { Cell::new(0) };
     static CONFIRM: Cell<i32> = const { Cell::new(-1) };
     static LAST: Cell<(Option<Kind>, u64)> = const { Cell::new((None, 0)) }; // which flyout closed when
@@ -480,6 +484,7 @@ unsafe fn wifi_join(n: &Net, pass: &str) {
 fn size(k: Kind) -> (i32, i32) {
     match k {
         Kind::Quick => (360, 196 + if BRIGHT.load(Relaxed) >= 0 { 96 } else { 48 } + 64),
+        Kind::Mixer => (360, mixer_rows().2),
         Kind::Cal => (330, 340),
         Kind::Wifi => (360, wifi_rows().2),
         Kind::Start => (560, 640),
@@ -509,6 +514,21 @@ fn wifi_rows() -> (Vec<(i32, i32)>, Option<i32>, i32) {
     })
 }
 
+const MX_APPS: usize = 8; // shortcut: no scrolling, the first eight apps (more than that rarely play at once)
+const MX_DEVS: usize = 6;
+const MX_ROW: i32 = 54;
+const MX_DEV: i32 = 36;
+
+/// Mixer panel in logical px: top of the app rows, top of the "Output device" block, panel height.
+/// The device block shows only when there is something to choose from.
+fn mixer_rows() -> (i32, i32, i32) {
+    let na = mixer::APPS.with_borrow(|a| a.len().min(MX_APPS)) as i32;
+    let nd = mixer::DEVS.with_borrow(|d| if d.len() > 1 { d.len().min(MX_DEVS) } else { 0 }) as i32;
+    let apps = 110;
+    let devs = apps + na * MX_ROW + if na > 0 { 8 } else { 0 };
+    (apps, devs, devs + if nd > 0 { 34 + nd * MX_DEV + 8 } else { 0 } + 56)
+}
+
 fn r(l: i32, t: i32, rr: i32, b: i32) -> RECT {
     RECT { left: sc(l), top: sc(t), right: sc(rr), bottom: sc(b) }
 }
@@ -530,6 +550,19 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
             v.push((r(16, y, 52, y + 40), Act::Mute));
             v.push((r(60, y, w - 16, y + 40), Act::VolSlide));
             v.push((r(w - 52, h - 48, w - 12, h - 8), Act::Settings("ms-settings:")));
+            v
+        }
+        Kind::Mixer => {
+            let (apps, devs, _) = mixer_rows();
+            let mut v = vec![(r(16, 52, 52, 92), Act::Mute), (r(60, 52, w - 56, 92), Act::VolSlide)];
+            for i in 0..mixer::APPS.with_borrow(|a| a.len().min(MX_APPS)) as i32 {
+                let y = apps + i * MX_ROW;
+                v.push((r(16, y + 8, 52, y + 44), Act::AppMute(i as u8)));
+                v.push((r(60, y + 18, w - 56, y + 50), Act::AppVol(i as u8)));
+            }
+            let nd = mixer::DEVS.with_borrow(|d| if d.len() > 1 { d.len().min(MX_DEVS) } else { 0 }) as i32;
+            v.extend((0..nd).map(|i| (r(8, devs + 34 + i * MX_DEV, w - 8, devs + 34 + (i + 1) * MX_DEV), Act::Dev(i as u8))));
+            v.push((r(8, h - 48, w - 8, h - 8), Act::Settings("ms-settings:sound")));
             v
         }
         Kind::Cal => vec![(r(w - 84, 10, w - 52, 42), Act::CalPrev), (r(w - 48, 10, w - 16, 42), Act::CalNext), (r(16, 10, w - 100, 42), Act::CalToday)],
@@ -678,6 +711,10 @@ pub fn close() {
     if FLY.get().is_some() {
         LAST.set((FLY.get(), unsafe { now_ms() }));
     }
+    if FLY.get() == Some(Kind::Mixer) {
+        mixer::drop_all();
+    }
+    DRAG.set(0);
     let h = FH.replace(null_mut());
     FLY.set(None);
     if h.is_null() {
@@ -761,6 +798,7 @@ pub fn toggle(k: Kind) {
                 read_brightness();
                 read_nets();
             }
+            Kind::Mixer => mixer::read(),
             Kind::Start => {
                 pinned_load(); // the search card (rs-launcher) can add to this list from another process
                 std::thread::spawn(load_apps); // apps installed since the last open show up (the panel repaints every second)
@@ -793,6 +831,9 @@ pub fn toggle(k: Kind) {
         ShowWindow(hw, SW_SHOW);
         force_fg(hw);
         SetTimer(hw, 1, 1000, None);
+        if k == Kind::Mixer {
+            SetTimer(hw, 2, 33, None); // the peak meters: 30 frames a second while the panel is open
+        }
         SetTimer(hw, 3, 15, None);
     }
 }
@@ -803,6 +844,8 @@ unsafe fn slide(a: Act, x: i32, rect: RECT) {
     let f = ((x - rect.left - sc(8)) as f32 / (rect.right - rect.left - sc(16)) as f32).clamp(0.0, 1.0);
     if a == Act::VolSlide {
         set_volume((f * 100.0).round() as i32);
+    } else if let Act::AppVol(i) = a {
+        mixer::set_app(i as usize, (f * 100.0).round() as i32);
     } else {
         BRIGHT.store(((f * 100.0) as i32).max(1), Relaxed);
     }
@@ -861,8 +904,12 @@ unsafe fn app_menu(hw: HWND, i: usize, x: i32, y: i32) {
 
 unsafe fn run_act(a: Act, rect: RECT, x: i32) {
     match a {
-        Act::VolSlide | Act::BrightSlide => {
-            DRAG.set(if a == Act::VolSlide { 1 } else { 2 });
+        Act::VolSlide | Act::BrightSlide | Act::AppVol(_) => {
+            DRAG.set(match a {
+                Act::VolSlide => 1,
+                Act::AppVol(i) => 3 + i,
+                _ => 2,
+            });
             SetCapture(FH.get());
             slide(a, x, rect);
         }
@@ -880,6 +927,8 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
             }
         },
         Act::Mute => toggle_mute(),
+        Act::AppMute(i) => mixer::mute_app(i as usize),
+        Act::Dev(i) => mixer::set_default(i as usize),
         Act::Menu(i) => {
             close();
             if let Some(pick) = MPICK.take() {
@@ -976,11 +1025,16 @@ fn sleep_now() {
 
 // ---------- painting ----------
 
-unsafe fn track(dc: HDC, rc: RECT, frac: f32) {
+/// A slider: the filled part up to `frac`, the round thumb, and inside the filled part a brighter run up to `peak`
+/// (0..1 of the filled part): the live level of what is playing.
+unsafe fn track(dc: HDC, rc: RECT, frac: f32, peak: f32) {
     let (l, rr, m) = (rc.left + sc(8), rc.right - sc(8), (rc.top + rc.bottom) / 2);
     fill(dc, RECT { left: l, top: m - sc(2), right: rr, bottom: m + sc(2) }, mix(pal().line, pal().dim, 0.3), sc(4));
     let x = l + ((rr - l) as f32 * frac.clamp(0.0, 1.0)) as i32;
     fill(dc, RECT { left: l, top: m - sc(2), right: x, bottom: m + sc(2) }, pal().accent, sc(4));
+    if peak > 0.01 {
+        fill(dc, RECT { left: l, top: m - sc(2), right: l + ((x - l) as f32 * peak.min(1.0)) as i32, bottom: m + sc(2) }, mix(pal().accent, pal().text, 0.55), sc(4));
+    }
     fill(dc, RECT { left: x - sc(8), top: m - sc(8), right: x + sc(8), bottom: m + sc(8) }, pal().text, sc(16));
 }
 
@@ -1043,13 +1097,13 @@ unsafe fn paint(hw: HWND, k: Kind) {
             if b >= 0 {
                 SelectObject(dc, f_glyph);
                 text(dc, "\u{E706}", r(16, y, 52, y + 40), pal().text, DT_CENTER);
-                track(dc, rs.iter().find(|(_, a)| *a == Act::BrightSlide).unwrap().0, b as f32 / 100.0);
+                track(dc, rs.iter().find(|(_, a)| *a == Act::BrightSlide).unwrap().0, b as f32 / 100.0, 0.0);
                 y += 48;
             }
             g(Act::Mute, r(16, y, 52, y + 40), pal().bg, pal().hover, sc(8));
             SelectObject(dc, f_glyph);
             text(dc, if muted || vol == 0 { "\u{E74F}" } else { "\u{E767}" }, r(16, y, 52, y + 40), pal().text, DT_CENTER);
-            track(dc, rs.iter().find(|(_, a)| *a == Act::VolSlide).unwrap().0, if muted { 0.0 } else { vol.max(0) as f32 / 100.0 });
+            track(dc, rs.iter().find(|(_, a)| *a == Act::VolSlide).unwrap().0, if muted { 0.0 } else { vol.max(0) as f32 / 100.0 }, 0.0);
             fill(dc, r(0, h - 56, w, h - 55), pal().line, 0);
             let (pct, ac) = BAT.get();
             SelectObject(dc, f_glyph);
@@ -1219,6 +1273,77 @@ unsafe fn paint(hw: HWND, k: Kind) {
             text(dc, t!("Параметры сети", "Network settings"), RECT { left: last.0.left + sc(10), ..last.0 }, pal().accent, DT_LEFT);
             SelectObject(dc, f_glyph);
             text(dc, "\u{E76C}", RECT { left: last.0.right - sc(36), ..last.0 }, pal().accent, DT_CENTER); // chevron right
+        }
+        Kind::Mixer => {
+            let rs = rects(k);
+            let at = |a: Act| rs.iter().find(|(_, x)| *x == a).map(|x| x.0);
+            let (apps_y, devs_y, _) = mixer_rows();
+            SelectObject(dc, f_title);
+            let dev = mixer::device_name();
+            text(dc, if dev.is_empty() { t!("Громкость", "Volume") } else { &dev }, r(18, 12, w - 16, 44), pal().text, DT_LEFT);
+            // master: mute, slider with the device's live level, percent
+            g(Act::Mute, r(16, 52, 52, 92), pal().bg, pal().hover, sc(8));
+            SelectObject(dc, f_glyph);
+            text(dc, if muted || vol == 0 { "\u{E74F}" } else { "\u{E767}" }, r(16, 52, 52, 92), if muted { BAD } else { pal().text }, DT_CENTER);
+            if let Some(rc) = at(Act::VolSlide) {
+                track(dc, rc, if muted { 0.0 } else { vol.max(0) as f32 / 100.0 }, mixer::MASTER_PEAK.get());
+            }
+            SelectObject(dc, f_txt);
+            text(dc, &if muted { "–".to_string() } else { vol.max(0).to_string() }, r(w - 54, 52, w - 12, 92), pal().text, DT_CENTER);
+            fill(dc, r(16, 100, w - 16, 101), pal().line, 0);
+            mixer::APPS.with_borrow(|apps| {
+                if apps.is_empty() {
+                    SelectObject(dc, f_small);
+                    text(dc, t!("Сейчас ничего не играет", "Nothing is playing"), r(16, apps_y - 4, w - 16, apps_y + 28), pal().dim, DT_CENTER);
+                }
+                for (i, a) in apps.iter().take(MX_APPS).enumerate() {
+                    let y = apps_y + i as i32 * MX_ROW;
+                    let ib = r(16, y + 8, 52, y + 44);
+                    g(Act::AppMute(i as u8), ib, pal().bg, pal().hover, sc(8));
+                    if a.icon.is_null() {
+                        SelectObject(dc, f_glyph);
+                        text(dc, "\u{E7F5}", ib, pal().text, DT_CENTER);
+                    } else {
+                        DrawIconEx(dc, ib.left + (ib.right - ib.left - icon_px()) / 2, ib.top + (ib.bottom - ib.top - icon_px()) / 2, a.icon, icon_px(), icon_px(), 0, null_mut(), DI_NORMAL);
+                    }
+                    if a.muted {
+                        // a red "muted" badge on the icon's corner
+                        fill(dc, RECT { left: ib.right - sc(16), top: ib.bottom - sc(16), right: ib.right - sc(2), bottom: ib.bottom - sc(2) }, BAD, sc(14));
+                        fill(dc, RECT { left: ib.right - sc(13), top: ib.bottom - sc(10), right: ib.right - sc(5), bottom: ib.bottom - sc(8) }, pal().bg, 0);
+                    }
+                    SelectObject(dc, f_small);
+                    text(dc, &a.name, r(68, y + 4, w - 56, y + 22), mix(pal().dim, pal().text, if a.muted { 0.0 } else { 0.55 }), DT_LEFT);
+                    if let Some(rc) = at(Act::AppVol(i as u8)) {
+                        track(dc, rc, if a.muted { 0.0 } else { a.vol as f32 / 100.0 }, a.peak);
+                    }
+                    SelectObject(dc, f_txt);
+                    text(dc, &if a.muted { "–".to_string() } else { a.vol.to_string() }, r(w - 54, y + 18, w - 12, y + 50), pal().text, DT_CENTER);
+                }
+            });
+            mixer::DEVS.with_borrow(|devs| {
+                if devs.len() > 1 {
+                    fill(dc, r(16, devs_y, w - 16, devs_y + 1), pal().line, 0);
+                    SelectObject(dc, f_small);
+                    text(dc, t!("Устройство вывода", "Output device"), r(18, devs_y + 6, w - 16, devs_y + 32), pal().dim, DT_LEFT);
+                    for (i, d) in devs.iter().take(MX_DEVS).enumerate() {
+                        let rc = r(8, devs_y + 34 + i as i32 * MX_DEV, w - 8, devs_y + 34 + (i as i32 + 1) * MX_DEV);
+                        g(Act::Dev(i as u8), rc, pal().bg, pal().hover, sc(8));
+                        if d.default {
+                            let m = (rc.top + rc.bottom) / 2;
+                            fill(dc, RECT { left: rc.left + sc(3), top: m - sc(8), right: rc.left + sc(6), bottom: m + sc(8) }, pal().accent, sc(3));
+                        }
+                        SelectObject(dc, f_txt);
+                        text(dc, &d.name, RECT { left: rc.left + sc(14), right: rc.right - sc(8), ..rc }, if d.default { pal().text } else { mix(pal().dim, pal().text, 0.6) }, DT_LEFT);
+                    }
+                }
+            });
+            fill(dc, r(0, h - 56, w, h - 55), pal().line, 0);
+            let sr = r(8, h - 48, w - 8, h - 8);
+            g(Act::Settings("ms-settings:sound"), sr, pal().bg, pal().hover, sc(8));
+            SelectObject(dc, f_txt);
+            text(dc, t!("Параметры звука", "Sound settings"), RECT { left: sr.left + sc(10), ..sr }, pal().text, DT_LEFT);
+            SelectObject(dc, f_glyph);
+            text(dc, "\u{E713}", RECT { left: sr.right - sc(40), ..sr }, pal().text, DT_CENTER);
         }
         Kind::Menu => {
             // header: the app's icon on an accent-tinted tile, its name, and what is open
@@ -1397,11 +1522,20 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         }
         WM_DROPFILES => on_files(hw, wp as HDROP),
         WM_TIMER if wp == 2 => {
+            if k == Kind::Mixer {
+                mixer::tick();
+            }
             InvalidateRect(hw, null(), 0);
         }
         WM_TIMER => {
-            if k == Kind::Wifi && PASS.with_borrow(|p| p.is_none()) {
-                read_nets();
+            let mixer = k == Kind::Mixer && DRAG.get() == 0; // not under a held slider: its row could move
+            if mixer || (k == Kind::Wifi && PASS.with_borrow(|p| p.is_none())) {
+                if mixer {
+                    read_volume();
+                    mixer::read();
+                } else {
+                    read_nets();
+                }
                 let (w, h) = (sc(size(k).0), sc(size(k).1));
                 // the panel hangs above the bar: keep its bottom edge where it is and grow / shrink upward
                 let (x, _) = FIN.get();
@@ -1414,7 +1548,11 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         }
         WM_MOUSEMOVE => {
             if DRAG.get() != 0 {
-                let want = if DRAG.get() == 1 { Act::VolSlide } else { Act::BrightSlide };
+                let want = match DRAG.get() {
+                    1 => Act::VolSlide,
+                    2 => Act::BrightSlide,
+                    n => Act::AppVol(n - 3),
+                };
                 if let Some((rc, a)) = rects(k).into_iter().find(|(_, a)| *a == want) {
                     slide(a, x, rc);
                 }
@@ -1451,6 +1589,11 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             let up = (wp >> 16) as i16 > 0;
             match k {
                 Kind::Quick => add_volume(if up { 2 } else { -2 }),
+                // over an app's row: that app; anywhere else: the master level
+                Kind::Mixer => match OVER.get() {
+                    Some(Act::AppVol(i) | Act::AppMute(i)) => mixer::add_app(i as usize, if up { 2 } else { -2 }),
+                    _ => add_volume(if up { 2 } else { -2 }),
+                },
                 Kind::Start => SCROLL.set(if up { SCROLL.get().saturating_sub(2) } else { (SCROLL.get() + 2).min(filtered().len().saturating_sub(ROWS)) }),
                 _ => {}
             }
