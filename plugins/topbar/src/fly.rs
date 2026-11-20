@@ -25,6 +25,9 @@ enum Act {
     AppVol(u8),  // mixer: the slider of app i
     AppMute(u8), // mixer: its icon (click = mute)
     Dev(u8),     // mixer: make output device i the default
+    MicSlide,    // mixer: the default microphone's level
+    MicMute,
+    InDev(u8),   // mixer: make input device i the default
     WifiSwitch,
     Tile(u8),
     WifiMore,
@@ -99,7 +102,7 @@ thread_local! {
     static ICONS: RefCell<HashMap<Vec<u16>, HICON>> = RefCell::new(HashMap::new()); // by path: the app list is reloaded and reordered
     static SEL: Cell<usize> = const { Cell::new(0) }; // Start: the row Enter opens (arrow keys move it)
     static OVER: Cell<Option<Act>> = const { Cell::new(None) };
-    static DRAG: Cell<u8> = const { Cell::new(0) }; // 0 none, 1 volume slider, 2 brightness slider, 3 + i the mixer slider of app i
+    static DRAG: Cell<u8> = const { Cell::new(0) }; // 0 none, 1 volume slider, 2 brightness slider, 3 + i the mixer slider of app i, 100 the microphone
     static MENU_X: Cell<i32> = const { Cell::new(0) };
     static CONFIRM: Cell<i32> = const { Cell::new(-1) };
     static LAST: Cell<(Option<Kind>, u64)> = const { Cell::new((None, 0)) }; // which flyout closed when
@@ -484,7 +487,7 @@ unsafe fn wifi_join(n: &Net, pass: &str) {
 fn size(k: Kind) -> (i32, i32) {
     match k {
         Kind::Quick => (360, 196 + if BRIGHT.load(Relaxed) >= 0 { 96 } else { 48 } + 64),
-        Kind::Mixer => (360, mixer_rows().2),
+        Kind::Mixer => (360, mixer_rows().3),
         Kind::Cal => (330, 340),
         Kind::Wifi => (360, wifi_rows().2),
         Kind::Start => (560, 640),
@@ -519,14 +522,23 @@ const MX_DEVS: usize = 6;
 const MX_ROW: i32 = 54;
 const MX_DEV: i32 = 36;
 
-/// Mixer panel in logical px: top of the app rows, top of the "Output device" block, panel height.
-/// The device block shows only when there is something to choose from.
-fn mixer_rows() -> (i32, i32, i32) {
+const MX_INS: usize = 4;
+
+/// Input devices listed in the mixer: none when there is nothing to choose from.
+fn mixer_ins() -> i32 {
+    mixer::INS.with_borrow(|d| if d.len() > 1 { d.len().min(MX_INS) } else { 0 }) as i32
+}
+
+/// Mixer panel in logical px: top of the app rows, top of the "Output device" block, top of the microphone block,
+/// panel height. The device lists show only when there is something to choose from, the microphone block only when
+/// there is a microphone.
+fn mixer_rows() -> (i32, i32, i32, i32) {
     let na = mixer::APPS.with_borrow(|a| a.len().min(MX_APPS)) as i32;
     let nd = mixer::DEVS.with_borrow(|d| if d.len() > 1 { d.len().min(MX_DEVS) } else { 0 }) as i32;
     let apps = 110;
     let devs = apps + na * MX_ROW + if na > 0 { 8 } else { 0 };
-    (apps, devs, devs + if nd > 0 { 34 + nd * MX_DEV + 8 } else { 0 } + 56)
+    let mic = devs + if nd > 0 { 34 + nd * MX_DEV + 8 } else { 0 };
+    (apps, devs, mic, mic + if mixer::MIC_VOL.get().0 >= 0 { 34 + 44 + mixer_ins() * MX_DEV + 6 } else { 0 } + 56)
 }
 
 fn r(l: i32, t: i32, rr: i32, b: i32) -> RECT {
@@ -553,7 +565,7 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
             v
         }
         Kind::Mixer => {
-            let (apps, devs, _) = mixer_rows();
+            let (apps, devs, mic, _) = mixer_rows();
             let mut v = vec![(r(16, 52, 52, 92), Act::Mute), (r(60, 52, w - 56, 92), Act::VolSlide)];
             for i in 0..mixer::APPS.with_borrow(|a| a.len().min(MX_APPS)) as i32 {
                 let y = apps + i * MX_ROW;
@@ -562,6 +574,11 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
             }
             let nd = mixer::DEVS.with_borrow(|d| if d.len() > 1 { d.len().min(MX_DEVS) } else { 0 }) as i32;
             v.extend((0..nd).map(|i| (r(8, devs + 34 + i * MX_DEV, w - 8, devs + 34 + (i + 1) * MX_DEV), Act::Dev(i as u8))));
+            if mixer::MIC_VOL.get().0 >= 0 {
+                v.push((r(16, mic + 34, 52, mic + 74), Act::MicMute));
+                v.push((r(60, mic + 34, w - 56, mic + 74), Act::MicSlide));
+                v.extend((0..mixer_ins()).map(|i| (r(8, mic + 78 + i * MX_DEV, w - 8, mic + 78 + (i + 1) * MX_DEV), Act::InDev(i as u8))));
+            }
             v.push((r(8, h - 48, w - 8, h - 8), Act::Settings("ms-settings:sound")));
             v
         }
@@ -846,6 +863,8 @@ unsafe fn slide(a: Act, x: i32, rect: RECT) {
         set_volume((f * 100.0).round() as i32);
     } else if let Act::AppVol(i) = a {
         mixer::set_app(i as usize, (f * 100.0).round() as i32);
+    } else if a == Act::MicSlide {
+        mixer::set_mic((f * 100.0).round() as i32);
     } else {
         BRIGHT.store(((f * 100.0) as i32).max(1), Relaxed);
     }
@@ -904,9 +923,10 @@ unsafe fn app_menu(hw: HWND, i: usize, x: i32, y: i32) {
 
 unsafe fn run_act(a: Act, rect: RECT, x: i32) {
     match a {
-        Act::VolSlide | Act::BrightSlide | Act::AppVol(_) => {
+        Act::VolSlide | Act::BrightSlide | Act::AppVol(_) | Act::MicSlide => {
             DRAG.set(match a {
                 Act::VolSlide => 1,
+                Act::MicSlide => 100,
                 Act::AppVol(i) => 3 + i,
                 _ => 2,
             });
@@ -929,6 +949,11 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
         Act::Mute => toggle_mute(),
         Act::AppMute(i) => mixer::mute_app(i as usize),
         Act::Dev(i) => mixer::set_default(i as usize),
+        Act::MicMute => mixer::mute_mic(),
+        Act::InDev(i) => {
+            mixer::set_default_in(i as usize);
+            mixer::read();
+        }
         Act::Menu(i) => {
             close();
             if let Some(pick) = MPICK.take() {
@@ -1277,7 +1302,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
         Kind::Mixer => {
             let rs = rects(k);
             let at = |a: Act| rs.iter().find(|(_, x)| *x == a).map(|x| x.0);
-            let (apps_y, devs_y, _) = mixer_rows();
+            let (apps_y, devs_y, mic_y, _) = mixer_rows();
             SelectObject(dc, f_title);
             let dev = mixer::device_name();
             text(dc, if dev.is_empty() { t!("Громкость", "Volume") } else { &dev }, r(18, 12, w - 16, 44), pal().text, DT_LEFT);
@@ -1337,6 +1362,35 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     }
                 }
             });
+            // the input side: the default microphone's level and mute, and the other microphones to switch to
+            let (mv, mm) = mixer::MIC_VOL.get();
+            if mv >= 0 {
+                fill(dc, r(16, mic_y, w - 16, mic_y + 1), pal().line, 0);
+                SelectObject(dc, f_small);
+                let name = mixer::mic_name();
+                text(dc, &if name.is_empty() { t!("Микрофон", "Microphone").to_string() } else { tf!("Микрофон · {name}", "Microphone · {name}") }, r(18, mic_y + 6, w - 16, mic_y + 32), pal().dim, DT_LEFT);
+                let mb = r(16, mic_y + 34, 52, mic_y + 74);
+                g(Act::MicMute, mb, pal().bg, pal().hover, sc(8));
+                SelectObject(dc, f_glyph);
+                text(dc, if mm { "\u{EC54}" } else { "\u{E720}" }, mb, if mm { BAD } else { pal().text }, DT_CENTER);
+                if let Some(rc) = at(Act::MicSlide) {
+                    track(dc, rc, if mm { 0.0 } else { mv as f32 / 100.0 }, 0.0);
+                }
+                SelectObject(dc, f_txt);
+                text(dc, &if mm { "–".to_string() } else { mv.to_string() }, r(w - 54, mic_y + 34, w - 12, mic_y + 74), pal().text, DT_CENTER);
+                mixer::INS.with_borrow(|ins| {
+                    for (i, d) in ins.iter().take(mixer_ins() as usize).enumerate() {
+                        let rc = r(8, mic_y + 78 + i as i32 * MX_DEV, w - 8, mic_y + 78 + (i as i32 + 1) * MX_DEV);
+                        g(Act::InDev(i as u8), rc, pal().bg, pal().hover, sc(8));
+                        if d.default {
+                            let m = (rc.top + rc.bottom) / 2;
+                            fill(dc, RECT { left: rc.left + sc(3), top: m - sc(8), right: rc.left + sc(6), bottom: m + sc(8) }, pal().accent, sc(3));
+                        }
+                        SelectObject(dc, f_txt);
+                        text(dc, &d.name, RECT { left: rc.left + sc(14), right: rc.right - sc(8), ..rc }, if d.default { pal().text } else { mix(pal().dim, pal().text, 0.6) }, DT_LEFT);
+                    }
+                });
+            }
             fill(dc, r(0, h - 56, w, h - 55), pal().line, 0);
             let sr = r(8, h - 48, w - 8, h - 8);
             g(Act::Settings("ms-settings:sound"), sr, pal().bg, pal().hover, sc(8));
@@ -1551,6 +1605,7 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                 let want = match DRAG.get() {
                     1 => Act::VolSlide,
                     2 => Act::BrightSlide,
+                    100 => Act::MicSlide,
                     n => Act::AppVol(n - 3),
                 };
                 if let Some((rc, a)) = rects(k).into_iter().find(|(_, a)| *a == want) {
@@ -1592,6 +1647,7 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                 // over an app's row: that app; anywhere else: the master level
                 Kind::Mixer => match OVER.get() {
                     Some(Act::AppVol(i) | Act::AppMute(i)) => mixer::add_app(i as usize, if up { 2 } else { -2 }),
+                    Some(Act::MicSlide | Act::MicMute) => mixer::set_mic(mixer::MIC_VOL.get().0 + if up { 2 } else { -2 }),
                     _ => add_volume(if up { 2 } else { -2 }),
                 },
                 Kind::Start => SCROLL.set(if up { SCROLL.get().saturating_sub(2) } else { (SCROLL.get() + 2).min(filtered().len().saturating_sub(ROWS)) }),
