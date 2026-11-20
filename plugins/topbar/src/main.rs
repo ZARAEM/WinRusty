@@ -209,6 +209,7 @@ thread_local! {
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static GLIDE: RefCell<HashMap<isize, (f32, u64, bool)>> = RefCell::new(HashMap::new()); // where each button is drawn: (x, last update ms, moving)
     static DRAGB: Cell<Option<Drag>> = const { Cell::new(None) };
+    static TDRAG: RefCell<Option<(String, i32, i32, bool)>> = const { RefCell::new(None) }; // held tray icon: its key, the hit it was pressed on, press x, moved
     static FLASH: RefCell<HashMap<isize, u64>> = RefCell::new(HashMap::new()); // windows asking for attention (FlashWindow) and since when
     static DESK_WINS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // what "show desktop" minimized, front window first
     static LIFTED: Cell<isize> = const { Cell::new(isize::MAX) }; // the button dragged last: it settles back down after the drop
@@ -370,8 +371,60 @@ unsafe fn tray_click(t: (HWND, u32, u32, u32), left: bool) {
 
 /// Indices into TAPPS of the icons kept on the bar; the rest live in the chevron flyout.
 fn bar_idx() -> Vec<usize> {
-    let shown = SHOWN.with_borrow(|s| s.clone());
-    TAPPS.with_borrow(|t| t.iter().enumerate().filter(|(_, x)| !x.hidden && shown.as_ref().is_some_and(|s| s.contains(&x.key))).map(|(i, _)| i).collect())
+    let shown = SHOWN.with_borrow(|s| s.clone()).unwrap_or_default();
+    TAPPS.with_borrow(|t| {
+        let mut v: Vec<usize> = t.iter().enumerate().filter(|(_, x)| !x.hidden && shown.contains(&x.key)).map(|(i, _)| i).collect();
+        v.sort_by_key(|&i| shown.iter().position(|k| *k == t[i].key)); // in the order the user dragged them into
+        v
+    })
+}
+
+/// The tray slot (1..=n; 0 is the chevron) under bar x `x`, for dropping a dragged icon.
+fn tray_slot(x: i32, apps0: i32, cell: i32, n: usize) -> usize {
+    ((x - apps0).div_euclid(cell.max(1)).max(1) as usize).min(n.max(1))
+}
+
+/// A tray icon is held and the pointer moved: past a few pixels it is a drag, and the icon takes the slot under the pointer.
+unsafe fn tray_drag_move(hwnd: HWND, x: i32) {
+    let Some((key, _, x0, moved)) = TDRAG.with_borrow(|d| d.clone()) else { return };
+    if !moved && (x - x0).abs() <= sc(6) {
+        return;
+    }
+    TDRAG.with_borrow_mut(|d| d.iter_mut().for_each(|d| d.3 = true));
+    hide_tip(hwnd);
+    let l = bar_layout(hwnd);
+    let mut order: Vec<String> = TAPPS.with_borrow(|t| bar_idx().into_iter().map(|i| t[i].key.clone()).collect());
+    let to = tray_slot(x, l.apps.0, sc(24), order.len());
+    order.dedup(); // one app with two icons: they move together
+    if let Some(cur) = order.iter().position(|k| *k == key) {
+        let at = (to - 1).min(order.len() - 1);
+        if cur != at {
+            let k = order.remove(cur);
+            order.insert(at, k);
+            // kept-on-the-bar apps that are not running right now stay in the list, after the visible ones
+            let rest: Vec<String> = SHOWN.with_borrow(|s| s.clone()).unwrap_or_default().into_iter().filter(|k| !order.contains(k)).collect();
+            order.extend(rest);
+            let _ = std::fs::write(appdata_file("topbar-tray.txt"), order.join("\n"));
+            SHOWN.set(Some(order));
+        }
+    }
+    HOT.set(TAPP + to as i32);
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// The tray icon is let go: a press that never moved is a click on it; dropped on the chevron it goes back into the flyout.
+unsafe fn tray_drag_end(hwnd: HWND, x: i32) {
+    let Some((key, h0, _, moved)) = TDRAG.take() else { return };
+    ReleaseCapture();
+    let h = hit(hwnd, x);
+    if !moved {
+        if h == h0 {
+            click(h0, true, false);
+        }
+    } else if h == TAPP {
+        toggle_shown(&key);
+    }
+    InvalidateRect(hwnd, null(), 0);
 }
 /// Bar slots of the tray: the chevron plus the icons kept on the bar.
 fn tray_count() -> usize {
@@ -2062,7 +2115,8 @@ unsafe fn paint(hwnd: HWND) {
     TAPPS.with_borrow(|t| {
         for (k, &ix) in bar.iter().enumerate() {
             let (i, ti) = (k + 1, &t[ix]);
-            let x = l.apps.0 + i as i32 * sc(24);
+            // glides to its slot when icons are dragged around or the tray grows
+            let x = glide(isize::MIN / 2 + ((ti.hwnd as isize) ^ ((ti.uid as isize) << 20)), l.apps.0 + i as i32 * sc(24));
             glow(dc, TAPP + i as i32, hot == TAPP + i as i32, cell(x, sc(24)), pal().bg, pal().hover, sc(8));
             if !ti.icon.is_null() {
                 DrawIconEx(dc, x + sc(4), mid - sc(8), ti.icon, sc(16), sc(16), 0, null_mut(), DI_NORMAL);
@@ -2758,11 +2812,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_MOUSEMOVE if DRAGB.get().is_some_and(|d| d.moved || (((lp & 0xffff) as i16 as i32) - d.x0).abs() > sc(6)) => drag_move(hwnd, (lp & 0xffff) as i16 as i32),
-        WM_LBUTTONUP => drag_end(hwnd, (lp & 0xffff) as i16 as i32),
+        WM_MOUSEMOVE if TDRAG.with_borrow(|d| d.is_some()) => tray_drag_move(hwnd, (lp & 0xffff) as i16 as i32),
+        WM_LBUTTONUP => {
+            drag_end(hwnd, (lp & 0xffff) as i16 as i32);
+            tray_drag_end(hwnd, (lp & 0xffff) as i16 as i32);
+        }
         WM_CAPTURECHANGED => {
             // something else took the mouse mid-drag (Alt+Tab, a system dialog): the button stays where it is now
             if lp as HWND != hwnd && DRAGB.take().is_some_and(|d| d.moved && d.key < 0) {
                 save_pin_order();
+            }
+            if lp as HWND != hwnd {
+                TDRAG.set(None);
             }
             InvalidateRect(hwnd, null(), 0);
         }
@@ -2809,6 +2870,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let key = BTNS.with_borrow(|b| b.get(h as usize).map(btn_key)).unwrap_or(0);
                 DRAGB.set(Some(Drag { key, h0: h, x0: x, grab: x - (l.x0 + (h + 1) * (l.bw + l.gap)), x, moved: false }));
                 SetCapture(hwnd);
+            } else if h > TAPP && h < TAPP + 100 && msg == WM_LBUTTONDOWN {
+                // a tray icon on the bar also acts on button-up: until then it may be dragged to another slot
+                let key = bar_idx().get((h - TAPP - 1) as usize).and_then(|&i| TAPPS.with_borrow(|t| t.get(i).map(|x| x.key.clone())));
+                if let Some(key) = key {
+                    TDRAG.set(Some((key, h, x, false)));
+                    SetCapture(hwnd);
+                }
             } else if h == NONE && msg == WM_RBUTTONDOWN {
                 fly::context_menu(x); // right click on an empty spot
             } else if h >= 1 && msg == WM_RBUTTONDOWN {
@@ -2995,6 +3063,17 @@ mod tests {
         assert!(flash_level(700) < 0.3);
         assert_eq!(flash_level(FLASH_MS), 0.8); // then stays lit
         assert!((0..FLASH_MS).step_by(50).all(|t| (0.0..=1.0).contains(&flash_level(t))));
+    }
+
+    #[test]
+    fn tray_drop_slot() {
+        use super::tray_slot;
+        // chevron at x 500..524, three icons after it
+        assert_eq!(tray_slot(530, 500, 24, 3), 1);
+        assert_eq!(tray_slot(560, 500, 24, 3), 2);
+        assert_eq!(tray_slot(900, 500, 24, 3), 3); // past the end: the last slot
+        assert_eq!(tray_slot(400, 500, 24, 3), 1); // left of the tray or on the chevron: the first icon slot
+        assert_eq!(tray_slot(510, 500, 24, 0), 1);
     }
 
     #[test]
