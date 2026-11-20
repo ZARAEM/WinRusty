@@ -25,6 +25,25 @@ thread_local! {
     static CX: Cell<i32> = const { Cell::new(0) }; // screen x the popup is centered on
     static POS: Cell<(i32, i32)> = const { Cell::new((0, 0)) }; // where it rests
     static T0: Cell<u64> = const { Cell::new(0) }; // when it started sliding in
+    static OVER_T: Cell<u64> = const { Cell::new(0) }; // since when the pointer has been on the current preview
+    static LIVE: Cell<HWND> = const { Cell::new(null_mut()) }; // the window shown on its own right now (the rest are glass)
+}
+
+/// Aero Peek: shows `win` alone on the desktop, every other window as a glass outline; None ends it. This is what the
+/// Windows taskbar does while the pointer rests on a thumbnail. Undocumented: dwmapi.dll exports it by ordinal 113 only
+/// (the taskbar replacements that have it call the same ordinal); if the export is missing nothing happens.
+unsafe fn live(win: Option<HWND>) {
+    if LIVE.get() == win.unwrap_or(null_mut()) {
+        return;
+    }
+    LIVE.set(win.unwrap_or(null_mut()));
+    let Some(f) = GetProcAddress(GetModuleHandleW(wide("dwmapi.dll").as_ptr()), 113usize as *const u8) else { return };
+    // (activate, window to show, window that asks: it stays visible, kind: 3 = one window, reserved)
+    let f: unsafe extern "system" fn(u32, HWND, HWND, u32, *const core::ffi::c_void) -> i32 = std::mem::transmute(f);
+    match win {
+        Some(w) => f(1, w, WND.get(), 3, null()),
+        None => f(0, null_mut(), null_mut(), 0, null()),
+    };
 }
 
 pub unsafe fn init(hi: HINSTANCE) {
@@ -68,6 +87,7 @@ pub unsafe fn hide() {
         return;
     }
     let w = WND.get();
+    live(None);
     KillTimer(w, 1);
     KillTimer(w, 2);
     ShowWindow(w, SW_HIDE);
@@ -186,6 +206,14 @@ unsafe fn poll(w: HWND) {
     if !inside && OVER.replace((-1, false)).0 >= 0 {
         InvalidateRect(w, null(), 0);
     }
+    // resting on one preview for half a second peeks at that window; moving off any preview ends the peek
+    let (over, on_close) = OVER.get();
+    let rest = ITEMS.with_borrow(|it| it.get(over.max(0) as usize).filter(|_| over >= 0 && !on_close && inside).map(|x| x.win));
+    match rest {
+        Some(win) if IsIconic(win) == 0 && now_ms().saturating_sub(OVER_T.get()) >= 500 => live(Some(win)),
+        Some(_) => {}
+        None => live(None),
+    }
     if inside || HOT.get() == FOR.get() {
         AWAY.set(0);
     } else if AWAY.replace(AWAY.get() + 1) >= 2 {
@@ -273,6 +301,7 @@ unsafe extern "system" fn proc(w: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         WM_MOUSEMOVE => {
             let o = at(x, y);
             if OVER.replace(o) != o {
+                OVER_T.set(now_ms());
                 InvalidateRect(w, null(), 0);
             }
         }
