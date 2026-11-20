@@ -47,15 +47,19 @@ powershell -ExecutionPolicy Bypass -File scripts\update-plugin.ps1 <rust-search|
 - Код установки (`src/install/`) ни разу не прогонялся целиком на живой системе: тестируй осторожно, по одному плагину.
 - Новый плагин: crate в `plugins/` + `members` в `Cargo.toml`, строка в `payload.txt`, файл в `src/install/`, запись в `PLUGINS`. Перед изменением системы сохраняй исходные значения, чтобы uninstall их вернул.
 
-## Публикация на GitHub (`Lemxy/WinRust`, ветка `main`)
+## Публикация на GitHub (форк `ZARAEM/WinRusty`, ветка `main`)
 
-`origin` = `https://github.com/Lemxy/WinRust.git`, аккаунт gh `Lemxy`.
+Это форк `Lemxy/WinRust`. `origin` = `https://github.com/ZARAEM/WinRusty`, владелец форка `ZARAEM`. В `Lemxy/WinRust` ничего не пушить и PR туда не открывать без прямой просьбы.
+
+На Linux (облачная сессия) собрать нельзя, но можно проверить типы: `rustup target add x86_64-pc-windows-msvc`, затем `cargo check --target x86_64-pc-windows-msvc -p topbar --tests`. Тесты запускаются только на Windows (CI на пуш в `main` и на PR). Что проверено только так, в ROADMAP помечай «собрано; на Windows не запускалось».
+
+Ниже правила автора оригинала; хук `Stop`, `scripts\publish.ps1` и аккаунт `Lemxy` относятся к его машине.
 
 **Автоматика.** Хук `Stop` (`.claude/settings.local.json`, не в git) после каждого ответа запускает `scripts\publish.ps1 -Auto`: есть изменения → коммит и пуш в `main`. Значит, **код должен собираться и проходить тесты к концу каждого ответа**. Скрипт сам отказывается пушить (и снимает индекс), если в изменениях `.exe/.dll/.pdb/.log/.reg/ключи`, `target/`, файлы больше 5 МБ или похожее на токен. Вручную: `scripts\publish.ps1 [-Message "..."]`. CI (`.github/workflows/build.yml`) собирает и тестирует каждый пуш.
 
 **Коммиты (требование владельца).**
 - Никаких `Co-Authored-By` и упоминаний Claude в коммитах, PR и релизах: Claude не должен появляться контрибьютором. Это важнее общих шаблонов атрибуции.
-- Автор: `Lemxy <183076981+Lemxy@users.noreply.github.com>` (уже в git config). Настоящую почту владельца в репозиторий не писать.
+- Автор коммитов форка: `ZARAEM <124304744+ZARAEM@users.noreply.github.com>` (в облачной сессии git config другой: передавай `--author` и `GIT_COMMITTER_*`). Настоящую почту владельца в репозиторий не писать.
 - `git push --force`, удаление репозитория/тегов/релизов и смена видимости только по прямой просьбе.
 - Не коммитить `payload\*.exe`, `target\`, логи (они в `.gitignore`).
 

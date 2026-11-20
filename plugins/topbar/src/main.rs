@@ -20,6 +20,7 @@ extern crate winrust_common;
 use winrust_common as i18n;
 use winrust_common::style::{Style, pal, style, ui_face};
 mod fly;
+mod mixer;
 use windows::{
     Win32::{
         Media::Audio::{Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender},
@@ -115,6 +116,22 @@ struct Pin {
     lnk: Vec<u16>,
     target: String, // lower-case exe path, "" if unknown
     icon: HICON,
+    id: isize, // negative, never reused: the button's identity for animations while pins are dragged around
+}
+/// Identity for a new pin (window buttons use their HWND, which is positive; 0 is Start).
+fn pin_id() -> isize {
+    thread_local!(static NEXT: Cell<isize> = const { Cell::new(-1) });
+    NEXT.replace(NEXT.get() - 1)
+}
+/// A press on an app button that may turn into dragging it to another place.
+#[derive(Clone, Copy)]
+struct Drag {
+    key: isize, // the button's identity (its index changes as it moves)
+    h0: i32,    // the button index it was pressed on
+    x0: i32,    // where the press was
+    grab: i32,  // from the button's left edge to the pointer
+    x: i32,     // the pointer now
+    moved: bool, // past the threshold: this is a drag, not a click
 }
 struct Btn {
     pin: Option<usize>,
@@ -188,6 +205,9 @@ thread_local! {
     static HOT: Cell<i32> = const { Cell::new(NONE) };
     static ORDER: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // unpinned windows in the order their buttons were added
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
+    static GLIDE: RefCell<HashMap<isize, (f32, u64, bool)>> = RefCell::new(HashMap::new()); // where each button is drawn: (x, last update ms, moving)
+    static DRAGB: Cell<Option<Drag>> = const { Cell::new(None) };
+    static LIFTED: Cell<isize> = const { Cell::new(isize::MAX) }; // the button dragged last: it settles back down after the drop
     static BUSY: Cell<bool> = const { Cell::new(false) }; // a fade is still running: the painter asks for another frame
     static BAR_P: Cell<f32> = const { Cell::new(0.0) }; // bar slide: 0 = off screen, 1 = in place
     static BAR_T: Cell<u64> = const { Cell::new(0) };
@@ -970,13 +990,97 @@ unsafe fn load_pins() {
     let mut files: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk"))).collect();
     files.sort();
     files.sort_by_key(|f| std::cmp::Reverse(lnk_uses(f))); // most used first (stable: ties stay alphabetical)
+    // ...but the order the user dragged them into wins; pins added since follow it
+    let saved: Vec<String> = std::fs::read_to_string(appdata_file("topbar-pins.txt")).unwrap_or_default().lines().map(str::to_string).collect();
+    files.sort_by_key(|f| saved_rank(&f.file_name().unwrap_or_default().to_string_lossy(), &saved));
     for f in files {
         let lnk = wide(&f.to_string_lossy());
         let target = lnk_target(&lnk);
         let target = fix_msix_pin(&lnk, &target).unwrap_or(target);
         let icon = lnk_icon(&lnk, &target);
-        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target, icon }));
+        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target, icon, id: pin_id() }));
     }
+}
+
+/// Place of the shortcut `name` in the saved order (file names, compared without case); unknown ones go after all saved.
+fn saved_rank(name: &str, saved: &[String]) -> usize {
+    saved.iter().position(|s| s.eq_ignore_ascii_case(name) || s.to_lowercase() == name.to_lowercase()).unwrap_or(usize::MAX)
+}
+
+/// Remembers the pins' current order (after a drag): one shortcut file name per line.
+fn save_pin_order() {
+    let names: String = PINS.with_borrow(|p| p.iter().map(|x| format!("{}\n", std::path::Path::new(&wstr_of(&x.lnk)).file_name().unwrap_or_default().to_string_lossy())).collect());
+    let _ = std::fs::write(appdata_file("topbar-pins.txt"), names);
+}
+
+/// What a button is, however the row is ordered: Start 0, a pin its id, a window its handle.
+fn btn_key(b: &Btn) -> isize {
+    b.pin.map(|p| PINS.with_borrow(|pins| pins.get(p).map_or(0, |p| p.id))).or_else(|| b.wins.first().map(|&w| w as isize)).unwrap_or(0)
+}
+
+/// Where button `from` would land if it were let go at `center` (the x of its middle): the nearest slot, but only inside
+/// its own group: pins stay among the pins (slots 1..=pins), window buttons among the windows.
+fn drop_slot(from: usize, center: i32, x0: i32, pitch: i32, pins: usize, n: usize) -> usize {
+    let (lo, hi) = if from <= pins { (1, pins) } else { (pins + 1, n.saturating_sub(1)) };
+    let slot = (center - x0).div_euclid(pitch.max(1)) - 1; // slot 0 of the row is the search button
+    (slot.max(0) as usize).clamp(lo, hi.max(lo))
+}
+
+/// The pointer moved while an app button is held: past a few pixels it becomes a drag, and the button changes places
+/// with its neighbours as its middle crosses into their slots (they glide aside, see `glide`).
+unsafe fn drag_move(hwnd: HWND, x: i32) {
+    let Some(mut d) = DRAGB.get() else { return };
+    d.x = x;
+    if !d.moved && (x - d.x0).abs() > sc(6) {
+        d.moved = true;
+        hide_tip(hwnd);
+        KillTimer(hwnd, 2);
+    }
+    DRAGB.set(Some(d));
+    if !d.moved {
+        return;
+    }
+    let l = bar_layout(hwnd);
+    let (cur, n) = BTNS.with_borrow(|b| (b.iter().position(|b| btn_key(b) == d.key), b.len()));
+    let Some(cur) = cur else {
+        DRAGB.set(None); // its window closed (or the pin went away) mid-drag
+        ReleaseCapture();
+        return;
+    };
+    let pins = PINS.with_borrow(|p| p.len());
+    let to = drop_slot(cur, x - d.grab + l.bw / 2, l.x0, l.bw + l.gap, pins, n);
+    if to != cur {
+        if cur <= pins {
+            PINS.with_borrow_mut(|p| {
+                let x = p.remove(cur - 1);
+                p.insert(to - 1, x);
+            });
+        } else {
+            ORDER.with_borrow_mut(|o| {
+                if cur - 1 - pins < o.len() && to - 1 - pins < o.len() {
+                    let w = o.remove(cur - 1 - pins);
+                    o.insert(to - 1 - pins, w);
+                }
+            });
+        }
+        refresh_buttons();
+    }
+    HOT.set(to as i32);
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// The button is let go: a press that never moved is a click; a drag keeps the new order (pins: saved to disk).
+unsafe fn drag_end(hwnd: HWND, x: i32) {
+    let Some(d) = DRAGB.take() else { return };
+    ReleaseCapture();
+    if !d.moved {
+        if hit(hwnd, x) == d.h0 {
+            click(d.h0, true, false);
+        }
+    } else if d.key < 0 {
+        save_pin_order();
+    }
+    InvalidateRect(hwnd, null(), 0);
 }
 
 fn refresh_buttons() {
@@ -1338,6 +1442,38 @@ unsafe fn glow(dc: HDC, key: i32, on: bool, r: RECT, from: u32, to: u32, rad: i3
     if t > 0.01 || p > 0.0 {
         fill(dc, r, mix(mix(from, to, t), pal().accent, 0.5 * p), rad);
     }
+}
+
+/// Where to draw the element `key` whose place is `target`: it glides there instead of jumping (buttons making room for
+/// a dragged one, the row re-centering when a window opens or closes). Frame-rate independent; sets BUSY while moving.
+unsafe fn glide(key: isize, target: i32) -> i32 {
+    let now = now_ms();
+    GLIDE.with_borrow_mut(|m| {
+        if m.len() > 512 {
+            m.clear(); // shortcut: closed windows are not pruned one by one; a clear only skips one glide
+        }
+        let e = m.entry(key).or_insert((target as f32, now, false));
+        let d = target as f32 - e.0;
+        if d.abs() < 0.5 {
+            *e = (target as f32, now, false);
+        } else {
+            let dt = if e.2 { now.saturating_sub(e.1).min(50) as f32 } else { 0.0 }; // at rest until now: the pause is not travel time
+            *e = (e.0 + d * glide_step(dt), now, true);
+            BUSY.set(true);
+        }
+        e.0.round() as i32
+    })
+}
+
+/// Share of the remaining distance covered in `dt` ms: half of it every ~45 ms, so a move is quick at first and settles softly.
+fn glide_step(dt: f32) -> f32 {
+    1.0 - (-dt / 65.0).exp()
+}
+
+/// Puts `key` at `x` right now (the dragged button follows the pointer; let go, it glides from there into its slot).
+unsafe fn glide_set(key: isize, x: i32) {
+    let now = now_ms();
+    GLIDE.with_borrow_mut(|m| m.insert(key, (x as f32, now, true)));
 }
 
 thread_local! {
@@ -1811,21 +1947,43 @@ unsafe fn paint(hwnd: HWND) {
     SelectObject(dc, f_glyph);
     text(dc, "\u{E713}", gr, if hot == GEAR { pal().text } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
 
-    // search button (left of Start)
-    let sb = RECT { left: l.x0, top, right: l.x0 + l.bw, bottom: bot };
+    // search button (left of Start); like every button of the row it glides to its place when the row shifts
+    let sx = glide(isize::MIN, l.x0);
+    let sb = RECT { left: sx, top, right: sx + l.bw, bottom: bot };
     glow(dc, SEARCH, hot == SEARCH, sb, pal().bg, pal().hover, sc(8));
     SelectObject(dc, f_glyph);
     text(dc, "\u{E721}", sb, if hot == SEARCH { pal().text } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
 
     // Start, pinned apps, open windows (center)
+    let drag = DRAGB.get().filter(|d| d.moved);
     BTNS.with_borrow(|btns| {
-        for (i, b) in btns.iter().enumerate() {
-            let x = l.x0 + (i as i32 + 1) * (l.bw + l.gap);
+        let slot = |i: usize| l.x0 + (i as i32 + 1) * (l.bw + l.gap);
+        let npins = PINS.with_borrow(|p| p.len());
+        let held = drag.and_then(|d| btns.iter().position(|b| btn_key(b) == d.key));
+        // the held button is painted last: it floats over the ones it passes
+        for i in (0..btns.len()).filter(|&i| Some(i) != held).chain(held) {
+            let b = &btns[i];
+            let key = btn_key(b);
+            if Some(i) == held {
+                LIFTED.set(key);
+            }
+            // 0..1: picked up; fades back after the drop (one fade, kept by identity: the index changes during a drag)
+            let lift = if key == LIFTED.get() { hv(4000, Some(i) == held) } else { 0.0 };
+            let x = match drag {
+                Some(d) if Some(i) == held => {
+                    // follows the pointer, inside its own group (pins among pins, windows among windows)
+                    let (lo, hi) = if i <= npins { (1, npins) } else { (npins + 1, btns.len() - 1) };
+                    let x = (d.x - d.grab).clamp(slot(lo), slot(hi.max(lo)));
+                    glide_set(key, x);
+                    x
+                }
+                _ => glide(key, slot(i)),
+            };
             let r = RECT { left: x, top, right: x + l.bw, bottom: bot };
             let act = b.wins.contains(&fg);
-            let (th, ta, tp) = (hv(i as i32, hot == i as i32), hv(2000 + i as i32, act), press_t(i as i32));
+            let (th, ta, tp) = (hv(i as i32, hot == i as i32).max(lift), hv(2000 + i as i32, act), press_t(i as i32));
             if th > 0.01 || ta > 0.01 || tp > 0.0 {
-                fill(dc, r, mix(mix(mix(pal().bg, pal().hover, th), active_bg, ta), pal().accent, 0.5 * tp), sc(8));
+                fill(dc, r, mix(mix(mix(pal().bg, pal().hover, th), active_bg, ta), pal().accent, (0.5 * tp).max(0.18 * lift)), sc(8));
             }
             if i == 0 {
                 // Windows logo in four tiles, lit from the top left; grows a little on hover, squeezes on click
@@ -1842,11 +2000,11 @@ unsafe fn paint(hwnd: HWND) {
                 Some(p) => PINS.with_borrow(|pins| pins.get(p).map_or(null_mut(), |p| p.icon)),
                 None => b.icon,
             };
-            let key = b.pin.map(|p| -(p as isize) - 1).or_else(|| b.wins.first().map(|&w| w as isize)).unwrap_or(0);
-            // squeezes on click, grows in when new, lifts a pixel on hover
-            let isz = (icon_px().min(l.bw - sc(6)) as f32 * (1.0 - 0.18 * tp) * (0.55 + 0.45 * appear(key))) as i32;
+            // squeezes on click, grows in when new, lifts a pixel on hover and a little more (and larger) while dragged
+            let press_sq = if Some(i) == held { 0.0 } else { tp }; // the press that began the drag must not squeeze it
+            let isz = (icon_px().min(l.bw - sc(6)) as f32 * (1.0 - 0.18 * press_sq) * (0.55 + 0.45 * appear(key)) * (1.0 + 0.1 * lift)) as i32;
             if !ic.is_null() {
-                DrawIconEx(dc, x + (l.bw - isz) / 2, mid - isz / 2 - sc(2) - (sc(1) as f32 * th) as i32, ic, isz, isz, 0, null_mut(), DI_NORMAL);
+                DrawIconEx(dc, x + (l.bw - isz) / 2, mid - isz / 2 - sc(2) - (sc(1) as f32 * th) as i32 - (sc(2) as f32 * lift) as i32, ic, isz, isz, 0, null_mut(), DI_NORMAL);
             }
             if !b.wins.is_empty() {
                 let min = b.wins.iter().all(|&w| IsIconic(w) != 0);
@@ -1889,7 +2047,7 @@ unsafe fn paint(hwnd: HWND) {
     let tb = RECT { left: l.sys.0, top, right: l.sys.1, bottom: bot };
     glow(dc, LANG, hot == LANG, RECT { left: tb.left, top, right: tb.left + sc(42), bottom: bot }, pal().bg, pal().hover, sc(8));
     let grp = RECT { left: tb.left + sc(44), top, right: tb.right, bottom: bot };
-    let (tg, pg) = (hv(SYS_GRP, matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick)), press_t(WIFI_I).max(press_t(VOL_I)).max(press_t(BAT_I)));
+    let (tg, pg) = (hv(SYS_GRP, matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick) || fly::is_open(fly::Kind::Mixer)), press_t(WIFI_I).max(press_t(VOL_I)).max(press_t(BAT_I)));
     if tg > 0.01 || pg > 0.0 {
         fill(dc, grp, mix(mix(pal().bg, pal().hover, tg), pal().accent, 0.5 * pg), sc(8));
     }
@@ -2134,7 +2292,7 @@ unsafe fn pin_exe(path: &str) {
     })();
     if ok.is_some() {
         let icon = lnk_icon(&lnk, exe);
-        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target: exe.to_string(), icon }));
+        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target: exe.to_string(), icon, id: pin_id() }));
     }
 }
 
@@ -2261,6 +2419,9 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         LANG if left => lang_menu(BAR.load(Relaxed) as HWND),
         LANG => next_lang(BAR.load(Relaxed) as HWND),
         WIFI_I => fly::toggle(if left { fly::Kind::Quick } else { fly::Kind::Wifi }), // right click: the network list
+        // the speaker, like EarTrumpet: left = the per-app mixer, middle = mute, right = the quick panel
+        VOL_I if mid => toggle_mute(),
+        VOL_I if left => fly::toggle(fly::Kind::Mixer),
         VOL_I | BAT_I => fly::toggle(fly::Kind::Quick),
         CLOCK if left => fly::toggle(fly::Kind::Cal),
         GEAR => style_menu(),
@@ -2286,13 +2447,19 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         }
         1.. => {
             let (wins, lnk) = BTNS.with_borrow(|b| b.get(h as usize).map(|b| (b.wins.clone(), b.pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| x.lnk.clone()))))).unwrap_or_default());
+            // like the Windows taskbar: a middle click or Shift+click starts another instance of a running app
+            let again = !wins.is_empty() && (mid || (left && GetKeyState(VK_SHIFT as i32) < 0));
+            let left = left || (mid && wins.is_empty()); // a middle click on a pin that is not running just opens it
             match (wins.first(), left) {
+                (Some(&w), _) if again => match &lnk {
+                    Some(l) => open(l),
+                    None => open(&wide(&exe_of(w))),
+                },
                 // not running: launch the pinned app (a Store app may have updated since the pins were loaded)
                 (None, true) => lnk.iter().for_each(|l| {
                     PINS.with_borrow_mut(|p| p.iter_mut().filter(|x| x.lnk == *l).for_each(|x| x.target = fix_msix_pin(l, &x.target).unwrap_or(std::mem::take(&mut x.target))));
                     open(l)
                 }),
-                (Some(&w), false) => close_window(w), // right / middle click
                 (Some(&w), true) => {
                     // like the Windows taskbar: the active app's button minimizes it, a minimized one restores, any other raises
                     let fg = GetForegroundWindow();
@@ -2428,6 +2595,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 SIG.set((s, quiet + 1));
             }
         }
+        WM_MOUSEMOVE if DRAGB.get().is_some_and(|d| d.moved || (((lp & 0xffff) as i16 as i32) - d.x0).abs() > sc(6)) => drag_move(hwnd, (lp & 0xffff) as i16 as i32),
+        WM_LBUTTONUP => drag_end(hwnd, (lp & 0xffff) as i16 as i32),
+        WM_CAPTURECHANGED => {
+            // something else took the mouse mid-drag (Alt+Tab, a system dialog): the button stays where it is now
+            if lp as HWND != hwnd && DRAGB.take().is_some_and(|d| d.moved && d.key < 0) {
+                save_pin_order();
+            }
+            InvalidateRect(hwnd, null(), 0);
+        }
         WM_MOUSEMOVE => {
             let h = hit(hwnd, (lp & 0xffff) as i16 as i32);
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
@@ -2462,7 +2638,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if h != NONE {
                 press(h);
             }
-            if h == NONE && msg == WM_RBUTTONDOWN {
+            if h >= 1 && msg == WM_LBUTTONDOWN {
+                // an app button acts when the mouse button comes up (drag_end): until then it may become a drag
+                let l = bar_layout(hwnd);
+                let key = BTNS.with_borrow(|b| b.get(h as usize).map(btn_key)).unwrap_or(0);
+                DRAGB.set(Some(Drag { key, h0: h, x0: x, grab: x - (l.x0 + (h + 1) * (l.bw + l.gap)), x, moved: false }));
+                SetCapture(hwnd);
+            } else if h == NONE && msg == WM_RBUTTONDOWN {
                 fly::context_menu(x); // right click on an empty spot
             } else if h >= 1 && msg == WM_RBUTTONDOWN {
                 app_menu(hwnd, h);
@@ -2620,6 +2802,23 @@ mod tests {
         assert!(at(-1, true) == Link::Cable);
         assert!(at(-1, false) == Link::Offline); // nothing at all: the crossed-out wifi icon
         assert_eq!((arcs_lit(0), arcs_lit(40), arcs_lit(100)), (1, 2, 3));
+    }
+
+    #[test]
+    fn dragging_buttons() {
+        use super::{drop_slot, glide_step, saved_rank};
+        // row: search | Start(0) | pins 1..=3 | windows 4..=5; first slot at x 100, 48 px apart
+        let at = |from: usize, slot: i32| drop_slot(from, 100 + (slot + 1) * 48 + 24, 100, 48, 3, 6);
+        assert_eq!(at(1, 3), 3); // a pin moves among the pins
+        assert_eq!(at(1, 5), 3); // ...and stops at the last pin, it does not join the windows
+        assert_eq!(at(2, -4), 1); // never onto Start or the search button
+        assert_eq!(at(5, 1), 4); // a window button stays right of the pins
+        assert_eq!(at(4, 9), 5);
+        assert_eq!(drop_slot(1, 0, 100, 48, 1, 2), 1); // a single pin has nowhere to go
+        let saved = ["B.lnk".to_string(), "a.lnk".to_string()];
+        assert_eq!((saved_rank("b.lnk", &saved), saved_rank("A.lnk", &saved), saved_rank("new.lnk", &saved)), (0, 1, usize::MAX));
+        assert_eq!(glide_step(0.0), 0.0);
+        assert!(glide_step(16.0) > 0.2 && glide_step(16.0) < 0.25 && glide_step(50.0) < 1.0);
     }
 
     #[test]
