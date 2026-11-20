@@ -209,6 +209,8 @@ thread_local! {
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static GLIDE: RefCell<HashMap<isize, (f32, u64, bool)>> = RefCell::new(HashMap::new()); // where each button is drawn: (x, last update ms, moving)
     static DRAGB: Cell<Option<Drag>> = const { Cell::new(None) };
+    static ROW: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) }; // the app buttons' keys in the order they are shown (pins and windows mixed)
+    static SPRING: Cell<(isize, u32)> = const { Cell::new((0, 0)) }; // button under a held mouse button that is not ours, and for how many polls
     static TDRAG: RefCell<Option<(String, i32, i32, bool)>> = const { RefCell::new(None) }; // held tray icon: its key, the hit it was pressed on, press x, moved
     static FLASH: RefCell<HashMap<isize, u64>> = RefCell::new(HashMap::new()); // windows asking for attention (FlashWindow) and since when
     static DESK_WINS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // what "show desktop" minimized, front window first
@@ -1067,7 +1069,8 @@ fn saved_rank(name: &str, saved: &[String]) -> usize {
 
 /// Remembers the pins' current order (after a drag): one shortcut file name per line.
 fn save_pin_order() {
-    let names: String = PINS.with_borrow(|p| p.iter().map(|x| format!("{}\n", std::path::Path::new(&wstr_of(&x.lnk)).file_name().unwrap_or_default().to_string_lossy())).collect());
+    let row = ROW.with_borrow(|r| r.clone());
+    let names: String = PINS.with_borrow(|p| row.iter().filter_map(|k| p.iter().find(|x| x.id == *k)).map(|x| format!("{}\n", std::path::Path::new(&wstr_of(&x.lnk)).file_name().unwrap_or_default().to_string_lossy())).collect());
     let _ = std::fs::write(appdata_file("topbar-pins.txt"), names);
 }
 
@@ -1076,8 +1079,9 @@ fn btn_key(b: &Btn) -> isize {
     b.pin.map(|p| PINS.with_borrow(|pins| pins.get(p).map_or(0, |p| p.id))).or_else(|| b.wins.first().map(|&w| w as isize)).unwrap_or(0)
 }
 
-/// Where button `from` would land if it were let go at `center` (the x of its middle): the nearest slot, but only inside
-/// its own group: pins stay among the pins (slots 1..=pins), window buttons among the windows.
+/// Where button `from` would land if it were let go at `center` (the x of its middle): the nearest slot inside its group.
+/// Slots 1..=pins are one group, the rest another; the bar passes pins = n - 1, which makes every app button one group
+/// (Start, slot 0, is never a target).
 fn drop_slot(from: usize, center: i32, x0: i32, pitch: i32, pins: usize, n: usize) -> usize {
     let (lo, hi) = if from <= pins { (1, pins) } else { (pins + 1, n.saturating_sub(1)) };
     let slot = (center - x0).div_euclid(pitch.max(1)) - 1; // slot 0 of the row is the search button
@@ -1105,22 +1109,14 @@ unsafe fn drag_move(hwnd: HWND, x: i32) {
         ReleaseCapture();
         return;
     };
-    let pins = PINS.with_borrow(|p| p.len());
-    let to = drop_slot(cur, x - d.grab + l.bw / 2, l.x0, l.bw + l.gap, pins, n);
+    let to = drop_slot(cur, x - d.grab + l.bw / 2, l.x0, l.bw + l.gap, n.saturating_sub(1), n); // one group: every app button
     if to != cur {
-        if cur <= pins {
-            PINS.with_borrow_mut(|p| {
-                let x = p.remove(cur - 1);
-                p.insert(to - 1, x);
-            });
-        } else {
-            ORDER.with_borrow_mut(|o| {
-                if cur - 1 - pins < o.len() && to - 1 - pins < o.len() {
-                    let w = o.remove(cur - 1 - pins);
-                    o.insert(to - 1 - pins, w);
-                }
-            });
-        }
+        ROW.with_borrow_mut(|r| {
+            if cur - 1 < r.len() && to - 1 < r.len() {
+                let k = r.remove(cur - 1);
+                r.insert(to - 1, k);
+            }
+        });
         refresh_buttons();
     }
     HOT.set(to as i32);
@@ -1135,8 +1131,8 @@ unsafe fn drag_end(hwnd: HWND, x: i32) {
         if hit(hwnd, x) == d.h0 {
             click(d.h0, true, false);
         }
-    } else if d.key < 0 {
-        save_pin_order();
+    } else {
+        save_pin_order(); // a window dragged between two pins changes nothing in the file; a pin dragged anywhere may
     }
     InvalidateRect(hwnd, null(), 0);
 }
@@ -1161,7 +1157,36 @@ fn refresh_buttons() {
         o.extend(loose.iter().filter(|w| !o.contains(w)).copied().collect::<Vec<_>>());
         btns.extend(o.iter().map(|&w| Btn { pin: None, wins: vec![w], icon: unsafe { win_icon(w) } }));
     });
+    // ...and then in the order of the row as the user arranged it: pins and windows mix freely, as on the Windows 11 taskbar
+    let start = btns.remove(0);
+    let mut rest: Vec<(isize, Btn)> = btns.into_iter().map(|b| (btn_key(&b), b)).collect();
+    let row = ROW.with_borrow_mut(|row| {
+        *row = row_merge(std::mem::take(row), &rest.iter().map(|(k, _)| *k).collect::<Vec<_>>());
+        row.clone()
+    });
+    let mut btns = vec![start];
+    for k in row {
+        if let Some(i) = rest.iter().position(|(x, _)| *x == k) {
+            btns.push(rest.remove(i).1);
+        }
+    }
     BTNS.set(btns);
+}
+
+/// The row's order after the set of buttons changed. `row`: the keys as arranged so far; `now`: the keys that exist,
+/// pins (negative) first. Gone ones leave, the others keep their places; a new pin goes after the last pin, a new
+/// window to the end.
+fn row_merge(mut row: Vec<isize>, now: &[isize]) -> Vec<isize> {
+    row.retain(|k| now.contains(k));
+    for &k in now.iter().filter(|k| !row.contains(k)).collect::<Vec<_>>() {
+        if k < 0 {
+            let at = row.iter().rposition(|&x| x < 0).map_or(0, |i| i + 1);
+            row.insert(at, k);
+        } else {
+            row.push(k);
+        }
+    }
+    row
 }
 
 unsafe fn endpoint() -> Option<IAudioEndpointVolume> {
@@ -2032,7 +2057,6 @@ unsafe fn paint(hwnd: HWND) {
     let drag = DRAGB.get().filter(|d| d.moved);
     BTNS.with_borrow(|btns| {
         let slot = |i: usize| l.x0 + (i as i32 + 1) * (l.bw + l.gap);
-        let npins = PINS.with_borrow(|p| p.len());
         let held = drag.and_then(|d| btns.iter().position(|b| btn_key(b) == d.key));
         // the held button is painted last: it floats over the ones it passes
         for i in (0..btns.len()).filter(|&i| Some(i) != held).chain(held) {
@@ -2045,8 +2069,8 @@ unsafe fn paint(hwnd: HWND) {
             let lift = if key == LIFTED.get() { hv(4000, Some(i) == held) } else { 0.0 };
             let x = match drag {
                 Some(d) if Some(i) == held => {
-                    // follows the pointer, inside its own group (pins among pins, windows among windows)
-                    let (lo, hi) = if i <= npins { (1, npins) } else { (npins + 1, btns.len() - 1) };
+                    // follows the pointer anywhere among the app buttons (never onto Start)
+                    let (lo, hi) = (1, btns.len() - 1);
                     let x = (d.x - d.grab).clamp(slot(lo), slot(hi.max(lo)));
                     glide_set(key, x);
                     x
@@ -2702,6 +2726,35 @@ unsafe fn min_rect(info: *mut ShellHookInfo, bar: HWND) {
     (*info).rc = RECT { left: x, top, right: x + l.bw, bottom: top + bar_h() - sc(8) };
 }
 
+/// Something is being dragged from another program (a file, text, a tab) and held over an app's button for about half
+/// a second: that app's window comes to the front so the drop can land in it, as on the Windows taskbar. Polled
+/// (4 times a second), because the bar takes drops through WM_DROPFILES and so never hears about a drag passing over it.
+unsafe fn spring(hwnd: HWND) {
+    let mut over: (isize, HWND) = (0, null_mut());
+    if GetAsyncKeyState(VK_LBUTTON as i32) < 0 && DRAGB.get().is_none() && TDRAG.with_borrow(|d| d.is_none()) {
+        let (mut pt, mut r): (POINT, RECT) = (zeroed(), zeroed());
+        GetCursorPos(&mut pt);
+        GetWindowRect(hwnd, &mut r);
+        if pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom && IsWindowVisible(hwnd) != 0 {
+            let h = hit(hwnd, pt.x - r.left);
+            if h >= 1 {
+                over = BTNS.with_borrow(|b| b.get(h as usize).and_then(|b| Some((btn_key(b), *b.wins.first()?)))).unwrap_or(over);
+            }
+        }
+    }
+    let (key, polls) = SPRING.get();
+    if over.0 == 0 || over.0 != key {
+        return SPRING.set((over.0, 0));
+    }
+    SPRING.set((key, polls + 1));
+    if polls + 1 == 2 && GetForegroundWindow() != over.1 {
+        if IsIconic(over.1) != 0 {
+            ShowWindow(over.1, SW_RESTORE);
+        }
+        force_fg(over.1);
+    }
+}
+
 /// Shows the window previews of bar button `h`. false = it has no open windows (or is not an app button at all).
 unsafe fn peek_for(hwnd: HWND, h: i32) -> bool {
     let wins = if h >= 1 { BTNS.with_borrow(|b| b.get(h as usize).map(|b| b.wins.clone())).unwrap_or_default() } else { vec![] };
@@ -2775,7 +2828,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_TIMER if wp == 6 => hide_tip(hwnd), // the volume readout after a wheel turn
-        WM_TIMER if wp == 3 => fs_update(hwnd),
+        WM_TIMER if wp == 3 => {
+            fs_update(hwnd);
+            spring(hwnd);
+        }
         WM_TIMER if wp == 7 => {
             KillTimer(hwnd, 7);
             let (tid, before) = LANG_TRY.get();
@@ -2819,7 +2875,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CAPTURECHANGED => {
             // something else took the mouse mid-drag (Alt+Tab, a system dialog): the button stays where it is now
-            if lp as HWND != hwnd && DRAGB.take().is_some_and(|d| d.moved && d.key < 0) {
+            if lp as HWND != hwnd && DRAGB.take().is_some_and(|d| d.moved) {
                 save_pin_order();
             }
             if lp as HWND != hwnd {
@@ -3041,7 +3097,12 @@ mod tests {
     #[test]
     fn dragging_buttons() {
         use super::{drop_slot, glide_step, saved_rank};
-        // row: search | Start(0) | pins 1..=3 | windows 4..=5; first slot at x 100, 48 px apart
+        use super::row_merge;
+        assert_eq!(row_merge(vec![], &[-1, -2, 50, 60]), [-1, -2, 50, 60]); // first time: pins, then windows
+        assert_eq!(row_merge(vec![-2, 50, -1, 60], &[-1, -2, 50, 60]), [-2, 50, -1, 60]); // a mixed order is kept
+        assert_eq!(row_merge(vec![-2, 50, -1, 60], &[-1, -2, -3, 60, 70]), [-2, -1, -3, 60, 70]); // new pin after the last pin, new window last, a closed one gone
+        assert_eq!(row_merge(vec![50], &[-1, 50]), [-1, 50]); // the first pin goes to the front
+        // drop_slot with two groups (its general form): search | Start(0) | pins 1..=3 | windows 4..=5; first slot at x 100, 48 px apart
         let at = |from: usize, slot: i32| drop_slot(from, 100 + (slot + 1) * 48 + 24, 100, 48, 3, 6);
         assert_eq!(at(1, 3), 3); // a pin moves among the pins
         assert_eq!(at(1, 5), 3); // ...and stops at the last pin, it does not join the windows
