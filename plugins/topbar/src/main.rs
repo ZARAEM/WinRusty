@@ -209,6 +209,7 @@ thread_local! {
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static GLIDE: RefCell<HashMap<isize, (f32, u64, bool)>> = RefCell::new(HashMap::new()); // where each button is drawn: (x, last update ms, moving)
     static DRAGB: Cell<Option<Drag>> = const { Cell::new(None) };
+    static PROG: RefCell<HashMap<isize, (u32, f32)>> = RefCell::new(HashMap::new()); // taskbar progress per window: (TBPF_* state, 0..1)
     static ROW: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) }; // the app buttons' keys in the order they are shown (pins and windows mixed)
     static SPRING: Cell<(isize, u32)> = const { Cell::new((0, 0)) }; // button under a held mouse button that is not ours, and for how many polls
     static TDRAG: RefCell<Option<(String, i32, i32, bool)>> = const { RefCell::new(None) }; // held tray icon: its key, the hit it was pressed on, press x, moved
@@ -1419,6 +1420,7 @@ fn refresh() {
         }
     }
     unsafe {
+        PROG.with_borrow_mut(|p| p.retain(|&w, _| IsWindow(w as HWND) != 0));
         FLASH.with_borrow_mut(|f| f.retain(|&w, _| IsWindow(w as HWND) != 0 && w as HWND != GetForegroundWindow()));
         // icons of apps that died without NIM_DELETE
         TAPPS.with_borrow_mut(|t| {
@@ -1571,6 +1573,14 @@ thread_local! {
 /// Marks `key` as just clicked / dropped on: its highlight flashes and its icon squeezes for a moment.
 unsafe fn press(key: i32) {
     PRESS.set((key, now_ms()));
+}
+
+const TB_PROGRESS_VALUE: u32 = WM_USER + 64; // what ITaskbarList3::SetProgressValue sends the taskbar: wp window, lp value
+const TB_PROGRESS_STATE: u32 = WM_USER + 65; // ...and SetProgressState: wp window, lp TBPF_* flags
+
+/// Progress 0..1 from the value SetProgressValue sends (the taskbar's scale ends at 0xFFFE).
+fn progress_frac(lp: isize) -> f32 {
+    (lp.clamp(0, 0xFFFE) as f32) / 0xFFFE as f32
 }
 
 const ATTN: u32 = rgb(240, 140, 40); // the orange of a taskbar button that wants attention
@@ -2119,6 +2129,22 @@ unsafe fn paint(hwnd: HWND) {
                 if b.wins.len() > 1 {
                     // a second, shorter pill: more than one window behind this button
                     fill(dc, RECT { left: x + (l.bw + pw) / 2 + sc(2), top: py, right: x + (l.bw + pw) / 2 + sc(5), bottom: py + sc(3) }, col, sc(3));
+                }
+                // taskbar progress (a download, a copy, an install): a bar along the button's bottom in place of the pill;
+                // green while it runs, yellow paused, red on an error, a sliding piece when the app does not know how long
+                if let Some((state, frac)) = PROG.with_borrow(|p| b.wins.iter().find_map(|&w| p.get(&(w as isize)).copied())) {
+                    let (tl, tr) = (x + sc(5), x + l.bw - sc(5));
+                    fill(dc, RECT { left: tl, top: py - sc(1), right: tr, bottom: py + sc(3) }, mix(pal().bg, pal().dim, 0.5), sc(4));
+                    let col = if state & 4 != 0 { BAD } else if state & 8 != 0 { WARN } else { GOOD };
+                    let (fl, fr) = if state & 1 != 0 {
+                        BUSY.set(true);
+                        let (seg, t) = ((tr - tl) / 3, (now_ms() % 1200) as f32 / 1200.0);
+                        let fl = tl + ((tr - tl - seg) as f32 * (0.5 - 0.5 * (t * std::f32::consts::TAU).cos())) as i32;
+                        (fl, fl + seg)
+                    } else {
+                        (tl, tl + (((tr - tl) as f32 * frac) as i32).max(sc(2)))
+                    };
+                    fill(dc, RECT { left: fl, top: py - sc(1), right: fr, bottom: py + sc(3) }, col, sc(4));
                 }
             }
         }
@@ -2819,6 +2845,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_PAINT => paint(hwnd),
         WM_ERASEBKGND => return 1,
+        TB_PROGRESS_VALUE => {
+            PROG.with_borrow_mut(|p| {
+                let e = p.entry(wp as isize).or_insert((2, 0.0)); // a value with no state yet means "normal"
+                e.1 = progress_frac(lp);
+                if e.0 & 1 != 0 {
+                    e.0 = 2; // a value ends the indeterminate state
+                }
+            });
+            InvalidateRect(hwnd, null(), 0);
+        }
+        TB_PROGRESS_STATE => {
+            PROG.with_borrow_mut(|p| {
+                if lp as u32 & 15 == 0 {
+                    p.remove(&(wp as isize)); // TBPF_NOPROGRESS
+                } else {
+                    p.entry(wp as isize).or_insert((0, 0.0)).0 = lp as u32 & 15;
+                }
+            });
+            InvalidateRect(hwnd, null(), 0);
+        }
         WM_TIMER if wp == 2 => {
             KillTimer(hwnd, 2);
             let h = HOT.get();
@@ -3026,6 +3072,9 @@ fn main() {
         // The bar may run elevated while apps and explorer do not; UIPI would drop their messages to us (icon data, appbar callbacks).
         ChangeWindowMessageFilterEx(HOST.get(), WM_COPYDATA, MSGFLT_ALLOW, null_mut());
         ChangeWindowMessageFilterEx(hwnd, CALLBACK, MSGFLT_ALLOW, null_mut());
+        for m in [TB_PROGRESS_VALUE, TB_PROGRESS_STATE] {
+            ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, null_mut()); // apps report progress with their own (normal) rights
+        }
         ChangeWindowMessageFilterEx(hwnd, TB_MSG.get(), MSGFLT_ALLOW, null_mut()); // explorer restarted (it runs unelevated)
         // files dragged from a normal-rights app onto the (elevated) bar: Start button = add to Start, elsewhere = pin
         DragAcceptFiles(hwnd, 1);
@@ -3135,6 +3184,13 @@ mod tests {
         assert_eq!(tray_slot(900, 500, 24, 3), 3); // past the end: the last slot
         assert_eq!(tray_slot(400, 500, 24, 3), 1); // left of the tray or on the chevron: the first icon slot
         assert_eq!(tray_slot(510, 500, 24, 0), 1);
+    }
+
+    #[test]
+    fn progress_scale() {
+        use super::progress_frac;
+        assert_eq!((progress_frac(0), progress_frac(0xFFFE), progress_frac(0x1_0000), progress_frac(-5)), (0.0, 1.0, 1.0, 0.0));
+        assert!((progress_frac(0x7FFF) - 0.5).abs() < 0.001);
     }
 
     #[test]
