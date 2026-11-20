@@ -101,6 +101,7 @@ const BAT_I: i32 = -9;
 const TAPP: i32 = -1000;
 const GEAR: i32 = -12; // the gear at the left end: the Style menu
 const GEAR_X: (i32, i32) = (6, 36); // its left edge and width, before scaling (sc() is applied where used)
+const DESK: i32 = -14; // the sliver at the far end of the bar: show the desktop
 const SYS_GRP: i32 = -11; // hover key of the one pill around wifi + volume + battery (they open the same panel)
 const WIN_START: u32 = WM_APP + 10; // posted by the keyboard hook: Win key pressed alone
 const ALT_TAB: u32 = WM_APP + 11; // posted by the keyboard hook: Alt+Tab (wp 1 = Shift held: backwards)
@@ -208,6 +209,8 @@ thread_local! {
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static GLIDE: RefCell<HashMap<isize, (f32, u64, bool)>> = RefCell::new(HashMap::new()); // where each button is drawn: (x, last update ms, moving)
     static DRAGB: Cell<Option<Drag>> = const { Cell::new(None) };
+    static FLASH: RefCell<HashMap<isize, u64>> = RefCell::new(HashMap::new()); // windows asking for attention (FlashWindow) and since when
+    static DESK_WINS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // what "show desktop" minimized, front window first
     static LIFTED: Cell<isize> = const { Cell::new(isize::MAX) }; // the button dragged last: it settles back down after the drop
     static BUSY: Cell<bool> = const { Cell::new(false) }; // a fade is still running: the painter asks for another frame
     static BAR_P: Cell<f32> = const { Cell::new(0.0) }; // bar slide: 0 = off screen, 1 = in place
@@ -568,6 +571,7 @@ unsafe fn tip_text(h: i32) -> String {
         0 => "Start".into(),
         TAPP => "Hidden icons".into(),
         GEAR => t!("Стиль", "Style").into(),
+        DESK => t!("Показать рабочий стол", "Show desktop").into(),
         CLOCK => {
             let mut t: SYSTEMTIME = zeroed();
             GetLocalTime(&mut t);
@@ -1337,6 +1341,7 @@ fn refresh() {
         }
     }
     unsafe {
+        FLASH.with_borrow_mut(|f| f.retain(|&w, _| IsWindow(w as HWND) != 0 && w as HWND != GetForegroundWindow()));
         // icons of apps that died without NIM_DELETE
         TAPPS.with_borrow_mut(|t| {
             t.retain(|x| {
@@ -1384,6 +1389,9 @@ unsafe fn hit(hwnd: HWND, x: i32) -> i32 {
     let l = layout(r.right);
     if x < sc(GEAR_X.0 + GEAR_X.1) {
         return GEAR;
+    }
+    if x >= l.clock.1 {
+        return DESK;
     }
     if x >= l.clock.0 {
         return CLOCK;
@@ -1485,6 +1493,17 @@ thread_local! {
 /// Marks `key` as just clicked / dropped on: its highlight flashes and its icon squeezes for a moment.
 unsafe fn press(key: i32) {
     PRESS.set((key, now_ms()));
+}
+
+const ATTN: u32 = rgb(240, 140, 40); // the orange of a taskbar button that wants attention
+const FLASH_MS: u64 = 2800; // how long it pulses before staying lit
+
+/// Brightness 0..1 of an attention flash `age` ms after it began: four pulses, then steadily lit.
+fn flash_level(age: u64) -> f32 {
+    if age >= FLASH_MS {
+        return 0.8;
+    }
+    0.25 + 0.75 * (0.5 - 0.5 * (age as f32 / 700.0 * std::f32::consts::TAU).cos())
 }
 
 /// 1.0 right after the click, easing to 0 over 320 ms (keeps the painter running meanwhile).
@@ -1984,8 +2003,14 @@ unsafe fn paint(hwnd: HWND) {
             let r = RECT { left: x, top, right: x + l.bw, bottom: bot };
             let act = b.wins.contains(&fg);
             let (th, ta, tp) = (hv(i as i32, hot == i as i32).max(lift), hv(2000 + i as i32, act), press_t(i as i32));
-            if th > 0.01 || ta > 0.01 || tp > 0.0 {
-                fill(dc, r, mix(mix(mix(pal().bg, pal().hover, th), active_bg, ta), pal().accent, (0.5 * tp).max(0.18 * lift)), sc(8));
+            // a window asking for attention: its button pulses orange a few times, then stays lit until the window is opened
+            let since = FLASH.with_borrow(|f| b.wins.iter().filter_map(|&w| f.get(&(w as isize)).copied()).min());
+            let tf = since.map_or(0.0, |t0| flash_level(now_ms().saturating_sub(t0)));
+            if since.is_some_and(|t0| now_ms().saturating_sub(t0) < FLASH_MS) {
+                BUSY.set(true);
+            }
+            if th > 0.01 || ta > 0.01 || tp > 0.0 || tf > 0.0 {
+                fill(dc, r, mix(mix(mix(mix(pal().bg, pal().hover, th), active_bg, ta), ATTN, 0.6 * tf), pal().accent, (0.5 * tp).max(0.18 * lift)), sc(8));
             }
             if i == 0 {
                 // Windows logo in four tiles, lit from the top left; grows a little on hover, squeezes on click
@@ -2012,7 +2037,7 @@ unsafe fn paint(hwnd: HWND) {
                 let min = b.wins.iter().all(|&w| IsIconic(w) != 0);
                 let pw = sc(6) + (sc(12) as f32 * ta) as i32; // the running-app pill stretches when its window is active
                 let py = bot - sc(4);
-                let col = if act { pal().accent } else if min { mix(pal().dim, pal().bg, 0.45) } else { pal().dim };
+                let col = if tf > 0.0 { ATTN } else if act { pal().accent } else if min { mix(pal().dim, pal().bg, 0.45) } else { pal().dim };
                 fill(dc, RECT { left: x + (l.bw - pw) / 2, top: py, right: x + (l.bw + pw) / 2, bottom: py + sc(3) }, col, sc(3));
                 if b.wins.len() > 1 {
                     // a second, shorter pill: more than one window behind this button
@@ -2084,6 +2109,10 @@ unsafe fn paint(hwnd: HWND) {
     text(dc, &tm, RECT { left: cb.left, top: cb.top, right: cb.right, bottom: mid + sc(1) }, pal().text, DT_CENTER);
     SelectObject(dc, f_small);
     text(dc, &dt, RECT { left: cb.left, top: mid - sc(1), right: cb.right, bottom: cb.bottom }, mix(pal().dim, pal().text, 0.35), DT_CENTER);
+
+    // the show-desktop sliver at the far end: a hairline that lights up under the pointer
+    let td = hv(DESK, hot == DESK);
+    fill(dc, RECT { left: l.clock.1 + sc(2), top: top + sc(3), right: l.clock.1 + sc(2) + sc(1).max(1), bottom: bot - sc(3) }, mix(pal().line, pal().text, td), 0);
 
     BitBlt(wdc, 0, 0, cr.right, h, dc, 0, 0, SRCCOPY);
     SelectObject(dc, of);
@@ -2442,14 +2471,25 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 ti.into_iter().for_each(|ti| tray_click(ti, left));
             }
         }
+        DESK if left => show_desktop(),
         0 => {
             if left {
                 fly::toggle(fly::Kind::Start);
+            } else if !mid {
+                winx_menu(); // right click on Start: the Win+X menu
             }
         }
         1.. => {
             let (wins, lnk) = BTNS.with_borrow(|b| b.get(h as usize).map(|b| (b.wins.clone(), b.pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| x.lnk.clone()))))).unwrap_or_default());
-            // like the Windows taskbar: a middle click or Shift+click starts another instance of a running app
+            // like the Windows taskbar: Ctrl+Shift+click starts the app as administrator
+            if left && GetKeyState(VK_CONTROL as i32) < 0 && GetKeyState(VK_SHIFT as i32) < 0 {
+                let target = lnk.clone().or_else(|| wins.first().map(|&w| wide(&exe_of(w))));
+                if let Some(t) = target.filter(|t| t.len() > 1) {
+                    ShellExecuteW(null_mut(), wide("runas").as_ptr(), t.as_ptr(), null(), null(), SW_SHOWNORMAL);
+                }
+                return;
+            }
+            // a middle click or Shift+click starts another instance of a running app
             let again = !wins.is_empty() && (mid || (left && GetKeyState(VK_SHIFT as i32) < 0));
             let left = left || (mid && wins.is_empty()); // a middle click on a pin that is not running just opens it
             match (wins.first(), left) {
@@ -2483,6 +2523,109 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         }
         _ => {}
     }
+}
+
+/// The sliver at the end of the bar (and the Win+X menu's "Desktop"): minimizes every open window; pressed again with
+/// nothing open, brings back the ones it minimized, in their old front-to-back order.
+unsafe fn show_desktop() {
+    let mut z: Vec<HWND> = Vec::new();
+    EnumWindows(Some(collect), &mut z as *mut _ as LPARAM); // front to back
+    z.retain(|&w| IsIconic(w) == 0);
+    if !z.is_empty() {
+        for &w in &z {
+            ShowWindow(w, SW_SHOWMINNOACTIVE);
+        }
+        DESK_WINS.set(z);
+    } else {
+        // back to front, so the window that was in front ends up there again
+        for w in DESK_WINS.take().into_iter().rev().filter(|&w| IsWindow(w) != 0) {
+            ShowWindow(w, SW_RESTORE);
+        }
+    }
+    refresh_buttons();
+    InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0);
+}
+
+/// Right click on Start: the system tools of the Windows Win+X menu.
+unsafe fn winx_menu() {
+    #[derive(Clone)]
+    enum W {
+        Open(String),  // through explorer: with the desktop user's rights (the tool asks for more itself)
+        Admin(String), // elevated
+        Files,
+        Run,
+        Desk,
+    }
+    let sys = |f: &str| format!(r"{}\System32\{f}", std::env::var("windir").unwrap_or_else(|_| r"C:\Windows".into()));
+    // Windows Terminal when it is installed (a per-user alias, no full path anywhere else), else Windows PowerShell
+    let wt = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join(r"Microsoft\WindowsApps\wt.exe");
+    let term = if wt.is_file() { wt.to_string_lossy().to_string() } else { sys(r"WindowsPowerShell\v1.0\powershell.exe") };
+    let rows: Vec<(&str, W, bool)> = vec![
+        (t!("Установленные приложения", "Installed apps"), W::Open("ms-settings:appsfeatures".into()), false),
+        (t!("Электропитание", "Power options"), W::Open("ms-settings:powersleep".into()), false),
+        (t!("Просмотр событий", "Event Viewer"), W::Open(sys("eventvwr.msc")), false),
+        (t!("Система", "System"), W::Open("ms-settings:about".into()), false),
+        (t!("Диспетчер устройств", "Device Manager"), W::Open(sys("devmgmt.msc")), false),
+        (t!("Сетевые подключения", "Network connections"), W::Open("ms-settings:network".into()), false),
+        (t!("Управление дисками", "Disk Management"), W::Open(sys("diskmgmt.msc")), false),
+        (t!("Управление компьютером", "Computer Management"), W::Open(sys("compmgmt.msc")), false),
+        (t!("Терминал", "Terminal"), W::Open(term.clone()), true),
+        (t!("Терминал (администратор)", "Terminal (Admin)"), W::Admin(term), false),
+        (t!("Диспетчер задач", "Task Manager"), W::Open(sys("taskmgr.exe")), true),
+        (t!("Параметры", "Settings"), W::Open("ms-settings:".into()), false),
+        (t!("Проводник", "File Explorer"), W::Files, false),
+        (t!("Выполнить", "Run"), W::Run, false),
+        (t!("Рабочий стол", "Desktop"), W::Desk, true),
+    ];
+    let acts: Vec<W> = rows.iter().map(|r| r.1.clone()).collect();
+    let hint = |w: &W| match w {
+        W::Files => "Win+E",
+        W::Run => "Win+R",
+        W::Desk => "Win+D",
+        _ => "",
+    };
+    let items = rows.iter().map(|(label, w, sep)| if *sep { fly::MItem::new(*label).hint(hint(w)).sep() } else { fly::MItem::new(*label).hint(hint(w)) }).collect();
+    fly::menu(tip_cx(&bar_layout(BAR.load(Relaxed) as HWND), 0), None, items, move |i| match acts.get(i) {
+        Some(W::Open(p)) => open(&wide(p)),
+        Some(W::Admin(p)) => drop(ShellExecuteW(null_mut(), wide("runas").as_ptr(), wide(p).as_ptr(), null(), null(), SW_SHOWNORMAL)),
+        Some(W::Files) => keys(&[VK_LWIN, b'E' as u16]), // whatever handles Win+E here: rust-explorer through reshell, or Explorer
+        Some(W::Run) => drop(Command::new("rundll32.exe").arg("shell32.dll,#61").spawn()), // the shell's Run dialog
+        Some(W::Desk) => show_desktop(),
+        None => {}
+    });
+}
+
+/// A shell hook event (window created, destroyed, activated, flashing...): the buttons follow at once instead of at the
+/// next half-second poll, and a window that calls FlashWindow lights its button up.
+unsafe fn shell_event(hwnd: HWND, code: usize, w: HWND) {
+    match code {
+        // HSHELL_FLASH; the window in front has nothing to ask for
+        0x8006 => {
+            let now = now_ms();
+            let new = w != GetForegroundWindow()
+                && FLASH.with_borrow_mut(|f| {
+                    let new = !f.contains_key(&(w as isize));
+                    f.entry(w as isize).or_insert(now);
+                    new
+                });
+            if !new {
+                return; // already lit (every blink of FlashWindowEx sends this again): the pulse does not start over
+            }
+        }
+        // HSHELL_REDRAW (the flashing ended, or just a new title), HSHELL_WINDOWACTIVATED (plain and "rude"), HSHELL_WINDOWDESTROYED
+        6 | 4 | 0x8004 | 2 => {
+            let lit = FLASH.with_borrow_mut(|f| f.remove(&(w as isize))).is_some();
+            if code == 6 && !lit {
+                return; // titles change all the time and the bar does not show them
+            }
+        }
+        1 => {} // HSHELL_WINDOWCREATED
+        _ => return,
+    }
+    if code != 6 && code != 0x8006 {
+        refresh_buttons();
+    }
+    InvalidateRect(hwnd, null(), 0);
 }
 
 #[repr(C)]
@@ -2519,6 +2662,7 @@ unsafe fn peek_for(hwnd: HWND, h: i32) -> bool {
 unsafe fn tip_cx(l: &Layout, h: i32) -> i32 {
     bar_x_w().0 + match h {
         GEAR => sc(GEAR_X.0 + GEAR_X.1 / 2),
+        DESK => l.clock.1 + sc(3),
         SEARCH => l.x0 + l.bw / 2,
         CLOCK => (l.clock.0 + l.clock.1) / 2,
         LANG => l.sys.0 + sc(21),
@@ -2552,6 +2696,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             min_rect(lp as *mut ShellHookInfo, hwnd); // HSHELL_GETMINRECT
             return 1;
         }
+        shell_event(hwnd, wp, lp as HWND);
         return 0;
     }
     if msg != 0 && msg == TB_MSG.get() {
@@ -2784,8 +2929,8 @@ fn main() {
             if let Some(f) = GetProcAddress(GetModuleHandleW(wide("user32.dll").as_ptr()), b"SetTaskmanWindow\0".as_ptr()) {
                 std::mem::transmute::<_, unsafe extern "system" fn(HWND) -> i32>(f)(hwnd);
             }
-            RegisterShellHookWindow(hwnd);
         }
+        RegisterShellHookWindow(hwnd); // window events (and flashing) come with or without explorer
         hide_taskbar();
         place(hwnd);
         refresh();
@@ -2840,6 +2985,16 @@ mod tests {
         assert_eq!((saved_rank("b.lnk", &saved), saved_rank("A.lnk", &saved), saved_rank("new.lnk", &saved)), (0, 1, usize::MAX));
         assert_eq!(glide_step(0.0), 0.0);
         assert!(glide_step(16.0) > 0.2 && glide_step(16.0) < 0.25 && glide_step(50.0) < 1.0);
+    }
+
+    #[test]
+    fn attention_flash() {
+        use super::{FLASH_MS, flash_level};
+        assert!(flash_level(0) < 0.3); // starts dim
+        assert!(flash_level(350) > 0.95); // peaks half a pulse later
+        assert!(flash_level(700) < 0.3);
+        assert_eq!(flash_level(FLASH_MS), 0.8); // then stays lit
+        assert!((0..FLASH_MS).step_by(50).all(|t| (0.0..=1.0).contains(&flash_level(t))));
     }
 
     #[test]
