@@ -119,6 +119,7 @@ struct Pin {
     target: String, // lower-case exe path, "" if unknown
     icon: HICON,
     id: isize, // negative, never reused: the button's identity for animations while pins are dragged around
+    aumid: String, // the app identity the shortcut names (Store apps, web apps), "" for a plain shortcut to an exe
 }
 /// Identity for a new pin (window buttons use their HWND, which is positive; 0 is Start).
 fn pin_id() -> isize {
@@ -139,6 +140,7 @@ struct Btn {
     pin: Option<usize>,
     wins: Vec<HWND>,
     icon: HICON, // the window's icon for unpinned buttons, looked up on refresh, not every animation frame
+    id: isize, // what the button is, however the row is ordered: 0 Start, a pin's id (negative), an app group's key (positive)
 }
 
 /// One notification-area icon, as an app registered it through Shell_NotifyIcon (we own the "Shell_TrayWnd" they talk to).
@@ -1155,7 +1157,8 @@ unsafe fn load_pins() {
         let target = lnk_target(&lnk);
         let target = fix_msix_pin(&lnk, &target).unwrap_or(target);
         let icon = lnk_icon(&lnk, &target);
-        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target, icon, id: pin_id() }));
+        let aumid = lnk_aumid(&lnk);
+        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target, icon, id: pin_id(), aumid }));
     }
 }
 
@@ -1171,9 +1174,74 @@ fn save_pin_order() {
     let _ = std::fs::write(appdata_file("topbar-pins.txt"), names);
 }
 
-/// What a button is, however the row is ordered: Start 0, a pin its id, a window its handle.
+/// What a button is, however the row is ordered: Start 0, a pin its id, an unpinned app its group key.
 fn btn_key(b: &Btn) -> isize {
-    b.pin.map(|p| PINS.with_borrow(|pins| pins.get(p).map_or(0, |p| p.id))).or_else(|| b.wins.first().map(|&w| w as isize)).unwrap_or(0)
+    b.id
+}
+
+thread_local! {
+    static APP_IDS: RefCell<HashMap<usize, (u32, String)>> = RefCell::new(HashMap::new()); // window -> (pid, app identity)
+    static GROUPS: RefCell<HashMap<String, isize>> = RefCell::new(HashMap::new()); // app identity -> button key
+}
+
+/// The button key of the unpinned app `id`: positive and far above any window handle, the same for as long as the bar runs.
+fn group_key(id: &str) -> isize {
+    GROUPS.with_borrow_mut(|g| {
+        let next = (1isize << 40) + g.len() as isize;
+        *g.entry(id.to_string()).or_insert(next)
+    })
+}
+
+/// PKEY_AppUserModel_ID from a property store: "" when it has none.
+unsafe fn store_aumid(s: &windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore) -> String {
+    const KEY: windows::Win32::Foundation::PROPERTYKEY = windows::Win32::Foundation::PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3), pid: 5 };
+    s.GetValue(&KEY).map(|v| v.to_string()).unwrap_or_default()
+}
+
+/// The app identity a shortcut names ("" for a plain shortcut).
+unsafe fn lnk_aumid(lnk: &[u16]) -> String {
+    (|| -> Option<String> {
+        let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        sl.cast::<IPersistFile>().ok()?.Load(PCWSTR(lnk.as_ptr()), STGM(0)).ok()?;
+        Some(store_aumid(&sl.cast().ok()?))
+    })()
+    .unwrap_or_default()
+}
+
+/// Which app a window belongs to, the way the Windows taskbar groups buttons: the identity the window itself declares
+/// (Store apps inside ApplicationFrameHost, web apps installed from a browser, separate browser profiles), else the
+/// identity of its packaged process, else its exe path. A window we can learn nothing about is an app of its own.
+unsafe fn app_id(w: HWND) -> String {
+    use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(w, &mut pid);
+    if let Some(id) = APP_IDS.with_borrow(|c| c.get(&(w as usize)).filter(|(p, _)| *p == pid).map(|(_, id)| id.clone())) {
+        return id;
+    }
+    let mut id = SHGetPropertyStoreForWindow::<IPropertyStore>(windows::Win32::Foundation::HWND(w as _)).map(|s| store_aumid(&s)).unwrap_or_default();
+    if id.is_empty() {
+        let p = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
+        if !p.is_null() {
+            let (mut b, mut n) = ([0u16; 260], 260u32);
+            if windows_sys::Win32::Storage::Packaging::Appx::GetApplicationUserModelId(p, &mut n, b.as_mut_ptr()) == 0 && n > 1 {
+                id = String::from_utf16_lossy(&b[..n as usize - 1]);
+            }
+            CloseHandle(p);
+        }
+    }
+    if id.is_empty() {
+        id = exe_of(w);
+    }
+    if id.is_empty() {
+        id = format!("window:{}", w as usize);
+    }
+    APP_IDS.with_borrow_mut(|c| {
+        if c.len() > 512 {
+            c.clear(); // closed windows never leave on their own
+        }
+        c.insert(w as usize, (pid, id.clone()));
+    });
+    id
 }
 
 /// Where button `from` would land if it were let go at `center` (the x of its middle): the nearest slot inside its group.
@@ -1234,25 +1302,40 @@ unsafe fn drag_end(hwnd: HWND, x: i32) {
     InvalidateRect(hwnd, null(), 0);
 }
 
+/// Whether a window with identity `id` and exe path `exe` belongs to a pin with that shortcut identity and target.
+/// A pin that names an app identity (a Store app, a web app, a browser profile) takes exactly that app's windows; a
+/// plain pin takes its exe's windows; and a window without an identity of its own still finds its exe's pin.
+fn pin_takes(pin_aumid: &str, pin_target: &str, id: &str, exe: &str) -> bool {
+    (!pin_aumid.is_empty() && pin_aumid == id) || (!pin_target.is_empty() && pin_target == exe && (pin_aumid.is_empty() || id == exe))
+}
+
 fn refresh_buttons() {
     let mut wins: Vec<HWND> = Vec::new();
     unsafe { EnumWindows(Some(collect), &mut wins as *mut _ as LPARAM) };
-    let mut btns = vec![Btn { pin: None, wins: vec![], icon: null_mut() }];
-    PINS.with_borrow(|pins| btns.extend((0..pins.len()).map(|i| Btn { pin: Some(i), wins: vec![], icon: null_mut() })));
+    let mut btns = vec![Btn { pin: None, wins: vec![], icon: null_mut(), id: 0 }];
+    PINS.with_borrow(|pins| btns.extend(pins.iter().enumerate().map(|(i, p)| Btn { pin: Some(i), wins: vec![], icon: null_mut(), id: p.id })));
     let mut loose: Vec<HWND> = Vec::new();
     for w in wins {
-        let exe = unsafe { exe_of(w) };
-        let pin = PINS.with_borrow(|p| p.iter().position(|p| !p.target.is_empty() && p.target == exe));
+        let (exe, id) = unsafe { (exe_of(w), app_id(w)) };
+        let pin = PINS.with_borrow(|p| p.iter().position(|p| pin_takes(&p.aumid, &p.target, &id, &exe)));
         match pin {
             Some(i) => btns[1 + i].wins.push(w),
             None => loose.push(w),
         }
     }
-    // EnumWindows lists by z-order, so clicking a window would jump its button to the front: keep the order they first appeared in
+    // EnumWindows lists by z-order, so clicking a window would jump its button to the front: keep the order they first
+    // appeared in. Windows of one app share a button, as on the Windows taskbar ("combine taskbar buttons").
     ORDER.with_borrow_mut(|o| {
         o.retain(|w| loose.contains(w));
         o.extend(loose.iter().filter(|w| !o.contains(w)).copied().collect::<Vec<_>>());
-        btns.extend(o.iter().map(|&w| Btn { pin: None, wins: vec![w], icon: unsafe { win_icon(w) } }));
+        let first = btns.len();
+        for &w in o.iter() {
+            let key = group_key(&unsafe { app_id(w) });
+            match btns[first..].iter_mut().find(|b| b.id == key) {
+                Some(b) => b.wins.push(w),
+                None => btns.push(Btn { pin: None, wins: vec![w], icon: unsafe { win_icon(w) }, id: key }),
+            }
+        }
     });
     // ...and then in the order of the row as the user arranged it: pins and windows mix freely, as on the Windows 11 taskbar
     let start = btns.remove(0);
@@ -2594,7 +2677,7 @@ unsafe fn pin_exe(path: &str) {
     })();
     if ok.is_some() {
         let icon = lnk_icon(&lnk, exe);
-        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target: exe.to_string(), icon, id: pin_id() }));
+        PINS.with_borrow_mut(|p| p.push(Pin { lnk, target: exe.to_string(), icon, id: pin_id(), aumid: String::new() }));
     }
 }
 
@@ -3409,6 +3492,18 @@ mod tests {
         assert_eq!(recent_ext("Downloads.lnk"), None); // a folder: no extension
         assert_eq!(recent_ext("notes.txt"), None); // not a shortcut
         assert_eq!(recent_ext("v1. final draft.lnk"), None); // a dot in a folder name is not an extension
+    }
+
+    #[test]
+    fn pins_take_their_apps_windows() {
+        use super::pin_takes;
+        let chrome = r"c:\program files\google\chrome\application\chrome.exe";
+        assert!(pin_takes("", chrome, chrome, chrome)); // plain pin, plain window
+        assert!(pin_takes("Chrome", chrome, "Chrome", chrome)); // Explorer's pin names the identity the windows declare
+        assert!(!pin_takes("Chrome", chrome, "Chrome._crx_abc", chrome)); // a web app installed from the browser is its own app
+        assert!(pin_takes("Chrome", chrome, chrome, chrome)); // the window's identity could not be read: its exe's pin
+        assert!(pin_takes("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "", "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", r"c:\windows\system32\applicationframehost.exe"));
+        assert!(!pin_takes("", "", "x", "")); // nothing known on either side is not a match
     }
 
     #[test]
