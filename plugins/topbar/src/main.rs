@@ -209,6 +209,9 @@ thread_local! {
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static GLIDE: RefCell<HashMap<isize, (f32, u64, bool)>> = RefCell::new(HashMap::new()); // where each button is drawn: (x, last update ms, moving)
     static DRAGB: Cell<Option<Drag>> = const { Cell::new(None) };
+    static LAUNCH: Cell<(isize, u64)> = const { Cell::new((0, 0)) }; // pin just started (its key) and when: its icon bobs until a window shows
+    static BAT_SECS: Cell<u32> = const { Cell::new(u32::MAX) }; // battery time left as Windows estimates it, u32::MAX = unknown
+    static TCLICK: Cell<(i32, u64)> = const { Cell::new((NONE, 0)) }; // last tray icon clicked and when: a second click in time is a double click
     #[allow(clippy::type_complexity)]
     static FDRAG: RefCell<Option<((HWND, u32, u32, u32), String)>> = const { RefCell::new(None) }; // icon held in the tray flyout: what a click sends, and its key
     static PROG: RefCell<HashMap<isize, (u32, f32)>> = RefCell::new(HashMap::new()); // taskbar progress per window: (TBPF_* state, 0..1)
@@ -374,6 +377,31 @@ unsafe fn tray_click(t: (HWND, u32, u32, u32), left: bool) {
     }
 }
 
+/// Posts raw mouse events to a tray icon's app in the form its version expects (double click, hover).
+unsafe fn tray_post(t: (HWND, u32, u32, u32), evs: &[u32]) {
+    let (hwnd, uid, cb, ver) = t;
+    if cb == 0 {
+        return;
+    }
+    let mut pt: POINT = zeroed();
+    GetCursorPos(&mut pt);
+    for &ev in evs {
+        if ver >= 4 {
+            PostMessageW(hwnd, cb, ((pt.x as u32 & 0xffff) | (pt.y as u32) << 16) as usize, (ev | (uid & 0xffff) << 16) as isize);
+        } else {
+            PostMessageW(hwnd, cb, uid as usize, ev as isize);
+        }
+    }
+}
+
+/// What a click on bar hit `h` would be sent to, when `h` is a tray icon.
+fn tray_at(h: i32) -> Option<(HWND, u32, u32, u32)> {
+    if h <= TAPP || h >= TAPP + 100 {
+        return None;
+    }
+    bar_idx().get((h - TAPP - 1) as usize).and_then(|&i| TAPPS.with_borrow(|t| t.get(i).map(|x| (x.hwnd, x.uid, x.cb, x.ver))))
+}
+
 /// Indices into TAPPS of the icons kept on the bar; the rest live in the chevron flyout.
 fn bar_idx() -> Vec<usize> {
     let shown = SHOWN.with_borrow(|s| s.clone()).unwrap_or_default();
@@ -424,7 +452,15 @@ unsafe fn tray_drag_end(hwnd: HWND, x: i32) {
     let h = hit(hwnd, x);
     if !moved {
         if h == h0 {
-            click(h0, true, false);
+            // the second click in time is a double click: many tray apps open their window only on that
+            let (last, at) = TCLICK.get();
+            if last == h0 && now_ms().saturating_sub(at) <= GetDoubleClickTime() as u64 {
+                TCLICK.set((NONE, 0));
+                tray_at(h0).into_iter().for_each(|t| tray_post(t, &[WM_LBUTTONDBLCLK, WM_LBUTTONUP]));
+            } else {
+                TCLICK.set((h0, now_ms()));
+                click(h0, true, false);
+            }
         }
     } else if h == TAPP {
         toggle_shown(&key);
@@ -670,7 +706,16 @@ unsafe fn tip_text(h: i32) -> String {
         },
         VOL_I => vol_tip(),
         BAT_I => match BAT.get() {
-            (p, ac) if p >= 0 => format!("Battery {p}%{}", if ac { " · plugged in" } else { "" }),
+            (p, ac) if p >= 0 => {
+                let left = match BAT_SECS.get() {
+                    u32::MAX => String::new(),
+                    s => {
+                        let (h, m) = (s / 3600, s % 3600 / 60);
+                        if h > 0 { tf!(" · осталось {h} ч {m} мин", " · {h} h {m} min left") } else { tf!(" · осталось {m} мин", " · {m} min left") }
+                    }
+                };
+                format!("Battery {p}%{}{left}", if ac { " · plugged in" } else { "" })
+            }
             _ => String::new(),
         },
         t if t > TAPP && t < TAPP + 100 => bar_idx().get((t - TAPP - 1) as usize).and_then(|&i| TAPPS.with_borrow(|t| t.get(i).map(|i| i.tip.clone()))).unwrap_or_default(),
@@ -1433,6 +1478,7 @@ fn refresh() {
         let mut p: SYSTEM_POWER_STATUS = zeroed();
         let ok = GetSystemPowerStatus(&mut p) != 0 && p.BatteryFlag & 128 == 0 && p.BatteryLifePercent <= 100;
         BAT.set(if ok { (p.BatteryLifePercent as i32, p.ACLineStatus == 1) } else { (-1, false) });
+        BAT_SECS.set(if ok && p.ACLineStatus != 1 { p.BatteryLifeTime } else { u32::MAX });
         read_volume();
         let up = !find_other("Shell_TrayWnd").is_null();
         if EXPLORER_UP.swap(up, Relaxed) && !up {
@@ -2143,8 +2189,17 @@ unsafe fn paint(hwnd: HWND) {
             // squeezes on click, grows in when new, lifts a pixel on hover and a little more (and larger) while dragged
             let press_sq = if Some(i) == held { 0.0 } else { tp }; // the press that began the drag must not squeeze it
             let isz = (icon_px().min(l.bw - sc(6)) as f32 * (1.0 - 0.18 * press_sq) * (0.55 + 0.45 * appear(key)) * (1.0 + 0.1 * lift)) as i32;
+            // a pin that was just started bobs until its window shows (three seconds at most): the click was heard
+            let (lk, lt) = LAUNCH.get();
+            let age = now_ms().saturating_sub(lt);
+            let bob = if lk == key && lk != 0 && age < 3000 && b.wins.is_empty() {
+                BUSY.set(true);
+                (sc(4) as f32 * (age as f32 / 380.0 * std::f32::consts::PI).sin().abs()) as i32
+            } else {
+                0
+            };
             if !ic.is_null() {
-                DrawIconEx(dc, x + (l.bw - isz) / 2, mid - isz / 2 - sc(2) - (sc(1) as f32 * th) as i32 - (sc(2) as f32 * lift) as i32, ic, isz, isz, 0, null_mut(), DI_NORMAL);
+                DrawIconEx(dc, x + (l.bw - isz) / 2, mid - isz / 2 - sc(2) - (sc(1) as f32 * th) as i32 - (sc(2) as f32 * lift) as i32 - bob, ic, isz, isz, 0, null_mut(), DI_NORMAL);
             }
             if !b.wins.is_empty() {
                 let min = b.wins.iter().all(|&w| IsIconic(w) != 0);
@@ -2678,6 +2733,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 },
                 // not running: launch the pinned app (a Store app may have updated since the pins were loaded)
                 (None, true) => lnk.iter().for_each(|l| {
+                    LAUNCH.set((BTNS.with_borrow(|b| b.get(h as usize).map(btn_key)).unwrap_or(0), now_ms()));
                     PINS.with_borrow_mut(|p| p.iter_mut().filter(|x| x.lnk == *l).for_each(|x| x.target = fix_msix_pin(l, &x.target).unwrap_or(std::mem::take(&mut x.target))));
                     open(l)
                 }),
@@ -2701,6 +2757,22 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
             }
         }
         _ => {}
+    }
+}
+
+/// The system menu of window `w` at the pointer, as Shift+right click on a taskbar button gives.
+/// shortcut: the items are not re-enabled for the window's current state first (Restore may be grey on a minimized one).
+unsafe fn sys_menu(bar: HWND, w: HWND) {
+    let m = GetSystemMenu(w, 0);
+    if m.is_null() {
+        return;
+    }
+    let mut pt: POINT = zeroed();
+    GetCursorPos(&mut pt);
+    SetForegroundWindow(bar); // or the menu would not close on a click elsewhere
+    let cmd = TrackPopupMenu(m, TPM_RETURNCMD | if at_top() { TPM_TOPALIGN } else { TPM_BOTTOMALIGN }, pt.x, pt.y, 0, bar, null());
+    if cmd != 0 {
+        PostMessageW(w, WM_SYSCOMMAND, cmd as usize, 0);
     }
 }
 
@@ -2944,6 +3016,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             KillTimer(hwnd, 2);
             let h = HOT.get();
             // a running app shows its windows' previews; everything else a text tip
+            if h == DESK && !fly::any_open() {
+                peek::desktop(true); // resting on the sliver looks through the windows; a click really minimizes them
+            }
             if h != NONE && !fly::any_open() && !peek_for(hwnd, h) {
                 show_tip(tip_text(h), tip_cx(&bar_layout(hwnd), h));
             }
@@ -3010,6 +3085,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             TrackMouseEvent(&mut tme);
             if HOT.replace(h) != h {
                 hide_tip(hwnd);
+                peek::desktop(false);
+                tray_at(h).into_iter().for_each(|t| tray_post(t, &[WM_MOUSEMOVE])); // apps that track the pointer over their icon
                 if peek::is_open() && peek_for(hwnd, h) {
                     // previews are up already: the next button's replace them at once, as on the Windows taskbar
                 } else if h != NONE {
@@ -3020,6 +3097,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSELEAVE => {
             hide_tip(hwnd);
+            peek::desktop(false);
             HOT.set(-1);
             InvalidateRect(hwnd, null(), 0);
         }
@@ -3038,6 +3116,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let h = hit(hwnd, x);
             hide_tip(hwnd);
             peek::hide();
+            peek::desktop(false);
             if h != NONE {
                 press(h);
             }
@@ -3057,7 +3136,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             } else if h == NONE && msg == WM_RBUTTONDOWN {
                 fly::context_menu(x); // right click on an empty spot
             } else if h >= 1 && msg == WM_RBUTTONDOWN {
-                app_menu(hwnd, h);
+                // Shift+right click: the window's own system menu (Restore, Move, Size, Minimize, Maximize, Close)
+                match BTNS.with_borrow(|b| b.get(h as usize).and_then(|b| b.wins.first().copied())) {
+                    Some(w) if GetKeyState(VK_SHIFT as i32) < 0 => sys_menu(hwnd, w),
+                    _ => app_menu(hwnd, h),
+                }
             } else {
                 click(h, msg == WM_LBUTTONDOWN, msg == WM_MBUTTONDOWN);
             }

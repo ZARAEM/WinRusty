@@ -32,6 +32,8 @@ thread_local! {
     pub static INS: RefCell<Vec<Dev>> = const { RefCell::new(Vec::new()) }; // active input devices (microphones)
     pub static MIC_VOL: Cell<(i32, bool)> = const { Cell::new((-1, false)) }; // default microphone: (percent or -1 = none, muted)
     static MIC: RefCell<Option<IAudioEndpointVolume>> = const { RefCell::new(None) };
+    static MIC_METER: RefCell<Option<IAudioMeterInformation>> = const { RefCell::new(None) };
+    pub static MIC_PEAK: Cell<f32> = const { Cell::new(0.0) }; // moves only while some app is recording
     static MASTER: RefCell<Option<IAudioMeterInformation>> = const { RefCell::new(None) };
     static NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new()); // exe path -> display name
 }
@@ -169,7 +171,7 @@ pub unsafe fn read() {
 
 /// The input side: the active microphones and the default one's level. On its own, so a PC without speakers still gets it.
 unsafe fn read_mic() {
-    let r = (|| -> windows::core::Result<(Vec<Dev>, IAudioEndpointVolume)> {
+    let r = (|| -> windows::core::Result<(Vec<Dev>, IAudioEndpointVolume, Option<IAudioMeterInformation>)> {
         let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let dev = en.GetDefaultAudioEndpoint(eCapture, eConsole)?;
         let def = dev_id(&dev);
@@ -182,16 +184,18 @@ unsafe fn read_mic() {
                 }
             }
         }
-        Ok((ins, dev.Activate(CLSCTX_ALL, None)?))
+        Ok((ins, dev.Activate(CLSCTX_ALL, None)?, dev.Activate(CLSCTX_ALL, None).ok()))
     })();
     match r {
-        Ok((ins, ep)) => {
+        Ok((ins, ep, meter)) => {
+            MIC_METER.set(meter);
             MIC_VOL.set(((ep.GetMasterVolumeLevelScalar().unwrap_or(0.0) * 100.0).round() as i32, ep.GetMute().is_ok_and(|m| m.as_bool())));
             INS.set(ins);
             MIC.set(Some(ep));
         }
         Err(_) => {
             MIC_VOL.set((-1, false));
+            MIC_METER.set(None);
             INS.set(Vec::new());
             MIC.set(None);
         }
@@ -228,6 +232,7 @@ pub unsafe fn mute_mic() {
 /// Forgets the sessions (the mixer closed): no COM objects are held while nobody looks.
 pub fn drop_all() {
     MIC.set(None);
+    MIC_METER.set(None);
     APPS.set(Vec::new());
     MASTER.set(None);
     MASTER_PEAK.set(0.0);
@@ -247,6 +252,8 @@ pub unsafe fn tick() {
     });
     let p = MASTER.with_borrow(|m| m.as_ref().and_then(|m| m.GetPeakValue().ok())).unwrap_or(0.0);
     MASTER_PEAK.set(follow(MASTER_PEAK.get(), if VOL.get().1 { 0.0 } else { p }));
+    let p = MIC_METER.with_borrow(|m| m.as_ref().and_then(|m| m.GetPeakValue().ok())).unwrap_or(0.0);
+    MIC_PEAK.set(follow(MIC_PEAK.get(), if MIC_VOL.get().1 { 0.0 } else { p }));
 }
 
 /// Sets the level of app `i` (0..100) on all its sessions and unmutes it.

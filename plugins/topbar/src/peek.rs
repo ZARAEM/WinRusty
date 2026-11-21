@@ -37,13 +37,25 @@ unsafe fn live(win: Option<HWND>) {
         return;
     }
     LIVE.set(win.unwrap_or(null_mut()));
-    let Some(f) = GetProcAddress(GetModuleHandleW(wide("dwmapi.dll").as_ptr()), 113usize as *const u8) else { return };
-    // (activate, window to show, window that asks: it stays visible, kind: 3 = one window, reserved)
-    let f: unsafe extern "system" fn(u32, HWND, HWND, u32, *const core::ffi::c_void) -> i32 = std::mem::transmute(f);
     match win {
-        Some(w) => f(1, w, WND.get(), 3, null()),
-        None => f(0, null_mut(), null_mut(), 0, null()),
-    };
+        Some(w) => dwm_peek(1, w, 3),
+        None => dwm_peek(0, null_mut(), 0),
+    }
+}
+
+/// (activate, window to show, kind: 1 = the desktop, 3 = one window); our popup is the asking window and stays visible.
+unsafe fn dwm_peek(on: u32, target: HWND, kind: u32) {
+    let Some(f) = GetProcAddress(GetModuleHandleW(wide("dwmapi.dll").as_ptr()), 113usize as *const u8) else { return };
+    let f: unsafe extern "system" fn(u32, HWND, HWND, u32, *const core::ffi::c_void) -> i32 = std::mem::transmute(f);
+    f(on, target, if on != 0 { WND.get() } else { null_mut() }, kind, null());
+}
+
+/// Peek at the desktop (every window turns to a glass outline) while the pointer rests on the show-desktop sliver.
+pub unsafe fn desktop(on: bool) {
+    thread_local!(static ON: Cell<bool> = const { Cell::new(false) });
+    if ON.replace(on) != on {
+        dwm_peek(on as u32, null_mut(), 1);
+    }
 }
 
 pub unsafe fn init(hi: HINSTANCE) {

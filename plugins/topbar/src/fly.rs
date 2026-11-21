@@ -1374,7 +1374,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 SelectObject(dc, f_glyph);
                 text(dc, if mm { "\u{EC54}" } else { "\u{E720}" }, mb, if mm { BAD } else { pal().text }, DT_CENTER);
                 if let Some(rc) = at(Act::MicSlide) {
-                    track(dc, rc, if mm { 0.0 } else { mv as f32 / 100.0 }, 0.0);
+                    track(dc, rc, if mm { 0.0 } else { mv as f32 / 100.0 }, mixer::MIC_PEAK.get());
                 }
                 SelectObject(dc, f_txt);
                 text(dc, &if mm { "–".to_string() } else { mv.to_string() }, r(w - 54, mic_y + 34, w - 12, mic_y + 74), pal().text, DT_CENTER);
