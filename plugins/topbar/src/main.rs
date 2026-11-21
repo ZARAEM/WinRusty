@@ -21,6 +21,7 @@ use winrust_common as i18n;
 use winrust_common::style::{Style, pal, style, ui_face};
 mod fly;
 mod mixer;
+mod notes;
 mod peek;
 use windows::{
     Win32::{
@@ -314,6 +315,7 @@ unsafe fn tray_msg(d: &[u8]) {
     let (op, flags, uid) = (u(4), u(20), u(16));
     let h = u(12) as i32 as isize as HWND;
     let guid: [u8; 16] = if flags & 0x20 != 0 { d[944..960].try_into().unwrap() } else { [0; 16] };
+    let mut note = None; // a notification this message carries (NIF_INFO), shown once TAPPS is no longer borrowed
     TAPPS.with_borrow_mut(|t| {
         let pos = t.iter().position(|x| x.hwnd == h && x.uid == uid && x.guid == guid);
         match (op, pos) {
@@ -355,10 +357,22 @@ unsafe fn tray_msg(d: &[u8]) {
                 if flags & 8 != 0 && u(292) & 1 != 0 {
                     x.hidden = u(288) & 1 != 0; // NIS_HIDDEN
                 }
+                if flags & 0x10 != 0 {
+                    // NIF_INFO: szInfo (256 chars) at 296, szInfoTitle (64 chars) at 812; an empty text takes a balloon down
+                    let s = |from: usize, to: usize| String::from_utf16_lossy(&d[from..to].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect::<Vec<u16>>());
+                    let (info, title) = (s(296, 808), s(812, 940));
+                    if !info.is_empty() {
+                        let app = if x.tip.is_empty() { x.key.clone() } else { x.tip.lines().next().unwrap_or_default().to_string() };
+                        note = Some((title, info, app, x.icon, (x.hwnd, x.uid, x.cb, x.ver)));
+                    }
+                }
             }
             _ => {}
         }
     });
+    if let Some((title, info, app, icon, src)) = note {
+        notes::push(title, info, app, icon, src);
+    }
 }
 
 unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -2414,6 +2428,10 @@ unsafe fn paint(hwnd: HWND) {
     text(dc, &tm, RECT { left: cb.left, top: cb.top, right: cb.right, bottom: mid + sc(1) }, pal().text, DT_CENTER);
     SelectObject(dc, f_small);
     text(dc, &dt, RECT { left: cb.left, top: mid - sc(1), right: cb.right, bottom: cb.bottom }, mix(pal().dim, pal().text, 0.35), DT_CENTER);
+    if notes::unread() > 0 {
+        // unread notifications: a dot in the clock's corner (right click on the clock lists them)
+        fill(dc, RECT { left: cb.right - sc(10), top: cb.top + sc(3), right: cb.right - sc(3), bottom: cb.top + sc(10) }, pal().accent, sc(7));
+    }
 
     // the show-desktop sliver at the far end: a hairline that lights up under the pointer
     let td = hv(DESK, hot == DESK);
@@ -2822,6 +2840,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         VOL_I if left => fly::toggle(fly::Kind::Mixer),
         VOL_I | BAT_I => fly::toggle(fly::Kind::Quick),
         CLOCK if left => fly::toggle(fly::Kind::Cal),
+        CLOCK if !mid => notes::menu(tip_cx(&bar_layout(BAR.load(Relaxed) as HWND), CLOCK)), // right click: the notification list
         GEAR => style_menu(),
         TAPP..=-900 => {
             let slot = (h - TAPP) as usize;
@@ -3350,6 +3369,7 @@ fn main() {
         load_pins();
         fly::init(GetModuleHandleW(null()));
         peek::init(GetModuleHandleW(null()));
+        notes::init(GetModuleHandleW(null()));
         thread::spawn(fly::load_apps);
         let hi = GetModuleHandleW(null());
         let class = wide("topbar");
