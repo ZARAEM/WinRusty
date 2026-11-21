@@ -28,6 +28,7 @@ enum Act {
     MicSlide,    // mixer: the default microphone's level
     MicMute,
     InDev(u8),   // mixer: make input device i the default
+    Media(u8),   // mixer: what is playing: 0 previous, 1 play / pause, 2 next
     WifiSwitch,
     Tile(u8),
     WifiMore,
@@ -523,6 +524,7 @@ const MX_ROW: i32 = 54;
 const MX_DEV: i32 = 36;
 
 const MX_INS: usize = 4;
+const MX_MEDIA: i32 = 62;
 
 /// Input devices listed in the mixer: none when there is nothing to choose from.
 fn mixer_ins() -> i32 {
@@ -538,7 +540,8 @@ fn mixer_rows() -> (i32, i32, i32, i32) {
     let apps = 110;
     let devs = apps + na * MX_ROW + if na > 0 { 8 } else { 0 };
     let mic = devs + if nd > 0 { 34 + nd * MX_DEV + 8 } else { 0 };
-    (apps, devs, mic, mic + if mixer::MIC_VOL.get().0 >= 0 { 34 + 44 + mixer_ins() * MX_DEV + 6 } else { 0 } + 56)
+    // ...then the "now playing" card when some app plays media (MX_MEDIA high), then the footer
+    (apps, devs, mic, mic + if mixer::MIC_VOL.get().0 >= 0 { 34 + 44 + mixer_ins() * MX_DEV + 6 } else { 0 } + if winrt::media().is_some() { MX_MEDIA } else { 0 } + 56)
 }
 
 fn r(l: i32, t: i32, rr: i32, b: i32) -> RECT {
@@ -578,6 +581,10 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
                 v.push((r(16, mic + 34, 52, mic + 74), Act::MicMute));
                 v.push((r(60, mic + 34, w - 56, mic + 74), Act::MicSlide));
                 v.extend((0..mixer_ins()).map(|i| (r(8, mic + 78 + i * MX_DEV, w - 8, mic + 78 + (i + 1) * MX_DEV), Act::InDev(i as u8))));
+            }
+            if winrt::media().is_some() {
+                let cy = h - 56 - MX_MEDIA;
+                v.extend((0..3u8).map(|i| (r(w - 16 - 3 * 40 + 40 * i as i32, cy + 12, w - 16 - 3 * 40 + 40 * i as i32 + 36, cy + 48), Act::Media(i))));
             }
             v.push((r(8, h - 48, w - 8, h - 8), Act::Settings("ms-settings:sound")));
             v
@@ -812,10 +819,14 @@ pub fn toggle(k: Kind) {
                 read_nets();
             }
             Kind::Quick => {
+                winrt::refresh(); // the Bluetooth tile
                 read_brightness();
                 read_nets();
             }
-            Kind::Mixer => mixer::read(),
+            Kind::Mixer => {
+                winrt::refresh();
+                mixer::read()
+            }
             Kind::Start => {
                 pinned_load(); // the search card (rs-launcher) can add to this list from another process
                 std::thread::spawn(load_apps); // apps installed since the last open show up (the panel repaints every second)
@@ -937,6 +948,7 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
         Act::WifiSwitch => wifi_radio(WIFI.get() < 0 && NETS.with_borrow(|n| n.is_empty())),
         Act::Tile(i) => match i {
             0 => wifi_radio(WIFI.get() < 0),
+            1 if winrt::bt() >= 0 => winrt::toggle_bt(), // a real switch when the PC has Bluetooth; its settings page otherwise
             5 => {
                 close();
                 keys(&[VK_LWIN, VK_CONTROL, b'L' as u16]); // live captions
@@ -950,6 +962,11 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
         Act::AppMute(i) => mixer::mute_app(i as usize),
         Act::Dev(i) => mixer::set_default(i as usize),
         Act::MicMute => mixer::mute_mic(),
+        // the media keys: whatever player holds the session answers, exactly as for a keyboard's keys
+        Act::Media(i) => {
+            keys(&[[VK_MEDIA_PREV_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_NEXT_TRACK][i as usize % 3]]);
+            winrt::refresh();
+        }
         Act::InDev(i) => {
             mixer::set_default_in(i as usize);
             mixer::read();
@@ -1093,7 +1110,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
             for (i, (glyph, label)) in tiles.iter().enumerate() {
                 let c = (i % 3) as i32;
                 let (tl, tt) = (16 + 112 * c, 16 + 96 * (i as i32 / 3));
-                let on = i == 0 && WIFI.get() >= 0;
+                let on = (i == 0 && WIFI.get() >= 0) || (i == 1 && winrt::bt() == 1);
                 let full = r(tl, tt, tl + 104, tt + 56);
                 fill(dc, full, if on { pal().accent } else { pal().line }, sc(8));
                 fill(dc, RECT { left: full.left + 1, top: full.top + 1, right: full.right - 1, bottom: full.bottom - 1 }, if on { pal().accent } else { mix(pal().bg, pal().line, 0.5) }, sc(8));
@@ -1391,6 +1408,22 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     }
                 });
             }
+            // what is playing, with previous / play-pause / next
+            if let Some((title, artist, playing)) = winrt::media() {
+                let cy = h - 56 - MX_MEDIA;
+                fill(dc, r(16, cy, w - 16, cy + 1), pal().line, 0);
+                SelectObject(dc, f_txt);
+                text(dc, &title, r(18, cy + 8, w - 144, cy + 32), pal().text, DT_LEFT);
+                SelectObject(dc, f_small);
+                text(dc, &artist, r(18, cy + 30, w - 144, cy + 52), pal().dim, DT_LEFT);
+                SelectObject(dc, f_glyph);
+                for (i, glyph) in ["\u{E892}", if playing { "\u{E769}" } else { "\u{E768}" }, "\u{E893}"].into_iter().enumerate() {
+                    if let Some(rc) = at(Act::Media(i as u8)) {
+                        g(Act::Media(i as u8), rc, pal().bg, pal().hover, sc(8));
+                        text(dc, glyph, rc, pal().text, DT_CENTER);
+                    }
+                }
+            }
             fill(dc, r(0, h - 56, w, h - 55), pal().line, 0);
             let sr = r(8, h - 48, w - 8, h - 8);
             g(Act::Settings("ms-settings:sound"), sr, pal().bg, pal().hover, sc(8));
@@ -1585,6 +1618,7 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             let mixer = k == Kind::Mixer && DRAG.get() == 0; // not under a held slider: its row could move
             if mixer || (k == Kind::Wifi && PASS.with_borrow(|p| p.is_none())) {
                 if mixer {
+                    winrt::refresh();
                     read_volume();
                     mixer::read();
                 } else {
