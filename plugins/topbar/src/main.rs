@@ -240,6 +240,30 @@ thread_local! {
     static LANG_TRY: Cell<(u32, usize)> = const { Cell::new((0, 0)) }; // (thread, layout before) of the last switch, checked by timer 7
 }
 
+thread_local! {
+    static CFG: RefCell<Option<Vec<String>>> = const { RefCell::new(None) }; // the taskbar settings that are switched on
+    static AUTO: Cell<bool> = const { Cell::new(false) }; // auto-hide is on and the bar has no reason to show right now
+    static AUTO_T: Cell<u64> = const { Cell::new(0) }; // last moment it had one
+}
+
+/// A taskbar setting from the gear menu ("left", "autohide", "seconds"): on or off. Kept in %APPDATA%\topbar-settings.txt,
+/// one switched-on name per line.
+fn cfg(key: &str) -> bool {
+    CFG.with_borrow_mut(|c| c.get_or_insert_with(|| std::fs::read_to_string(appdata_file("topbar-settings.txt")).unwrap_or_default().lines().map(str::to_string).collect()).iter().any(|k| k == key))
+}
+
+fn cfg_toggle(key: &str) {
+    let on = cfg(key); // loads the list
+    CFG.with_borrow_mut(|c| {
+        let list = c.as_mut().unwrap();
+        list.retain(|k| k != key);
+        if !on {
+            list.push(key.to_string());
+        }
+        let _ = std::fs::write(appdata_file("topbar-settings.txt"), list.join("\n"));
+    });
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
@@ -895,7 +919,8 @@ unsafe fn place(hwnd: HWND) {
     ab.hWnd = hwnd;
     // the reserved strip: the bar itself plus the dock's gap under it
     // the dock reserves nothing: maximized windows take the whole screen and the dock slides away over them
-    let strip = if style() == Style::Dock { 0 } else { bar_h() };
+    // an auto-hidden bar reserves nothing either: windows use the whole screen and the bar slides over them
+    let strip = if style() == Style::Dock || cfg("autohide") { 0 } else { bar_h() };
     if at_top() {
         ab.uEdge = ABE_TOP;
         ab.rc = RECT { left: 0, top: 0, right: cx, bottom: strip };
@@ -1532,7 +1557,9 @@ fn layout(w: i32) -> Layout {
     let fixed = (PINS.with_borrow(|p| p.len()) as i32 + 2).min(n);
     // ...but never so far right that the windows' buttons run into the tray: then the whole row shifts left
     let right_limit = w - margin - (n * (bw + gap) - gap);
-    Layout { x0: ((w - (fixed * (bw + gap) - gap)) / 2).min(right_limit).max(sc(GEAR_X.0 + GEAR_X.1 + 6)), bw, gap, apps, sys, clock } // clear of the gear
+    let left = sc(GEAR_X.0 + GEAR_X.1 + 6); // clear of the gear
+    let x0 = if cfg("left") { left } else { ((w - (fixed * (bw + gap) - gap)) / 2).min(right_limit).max(left) }; // "Buttons on the left", as the Windows setting
+    Layout { x0, bw, gap, apps, sys, clock }
 }
 
 unsafe fn hit(hwnd: HWND, x: i32) -> i32 {
@@ -1706,7 +1733,8 @@ unsafe fn bar_anim(hwnd: HWND) {
 }
 
 unsafe fn bar_step(hwnd: HWND) {
-    let target = if FULLSCREEN.load(Relaxed) { 0.0 } else { 1.0 }; // hides only for a fullscreen game or video: not over the desktop, not in any style
+    // hides for a fullscreen game or video, and, with "hide automatically" on, whenever nothing keeps it up
+    let target = if FULLSCREEN.load(Relaxed) || AUTO.get() { 0.0 } else { 1.0 };
     let now = now_ms();
     let dt = now.saturating_sub(BAR_T.replace(now)).min(50) as f32;
     let p = BAR_P.get();
@@ -1762,6 +1790,15 @@ unsafe fn fs_update(hwnd: HWND) {
     let over = if at_top() { pt.y <= 0 || (pt.y < bar_h() && BAR_P.get() > 0.0) } else { pt.y >= sh - 1 || (pt.y >= sh - bar_h() - dock_gap() && BAR_P.get() > 0.0) };
     if fs || !(desktop_now() || dock_covered()) || fly::any_open() || over {
         DESK_T.set(now);
+    }
+    // "hide automatically": the bar stays while the pointer is on it or at its screen edge, while a panel, a menu or the
+    // previews are open, and during a drag; 800 ms after the last of those it slides away
+    if !cfg("autohide") || over || fly::any_open() || peek::is_open() || DRAGB.get().is_some() || IsWindowVisible(TRAYFLY.get()) != 0 {
+        AUTO_T.set(now);
+    }
+    let auto = cfg("autohide") && now.saturating_sub(AUTO_T.get()) >= 800;
+    if AUTO.replace(auto) != auto {
+        bar_anim(hwnd);
     }
     let desk = !fs && now.saturating_sub(DESK_T.get()) >= 2000;
     if DESK_HIDE.swap(desk, Relaxed) != desk {
@@ -2084,7 +2121,7 @@ unsafe fn clock_texts() -> (String, String) {
     let mut t: SYSTEMTIME = zeroed();
     GetLocalTime(&mut t);
     let (mut a, mut b) = ([0u16; 40], [0u16; 40]);
-    let n = GetTimeFormatW(0x0400, 2, &t, null(), a.as_mut_ptr(), 40).max(1) as usize - 1; // LOCALE_USER_DEFAULT, TIME_NOSECONDS
+    let n = GetTimeFormatW(0x0400, if cfg("seconds") { 0 } else { 2 }, &t, null(), a.as_mut_ptr(), 40).max(1) as usize - 1; // LOCALE_USER_DEFAULT, TIME_NOSECONDS
     let m = GetDateFormatW(0x0400, 1, &t, null(), b.as_mut_ptr(), 40).max(1) as usize - 1; // DATE_SHORTDATE
     (String::from_utf16_lossy(&a[..n]), String::from_utf16_lossy(&b[..m]))
 }
@@ -2644,13 +2681,26 @@ unsafe fn style_menu() {
     let names = [t!("Обычный", "Normal"), t!("Терминал", "Terminal"), t!("Плавающий док", "Floating dock"), t!("Тайлинг", "Tiling")];
     let mut items: Vec<fly::MItem> = i18n::style::ALL.iter().zip(names).map(|(&s, n)| fly::MItem::new(n).on(s == style())).collect();
     items.push(fly::MItem::new(t!("Разложить окна плиткой", "Tile the windows")).sep());
+    // the taskbar's own settings, as in Windows' "Taskbar behaviors"
+    const KEYS: [&str; 3] = ["left", "autohide", "seconds"];
+    let labels = [t!("Кнопки слева", "Buttons on the left"), t!("Скрывать панель автоматически", "Hide the bar automatically"), t!("Секунды в часах", "Seconds in the clock")];
+    for (i, (k, label)) in KEYS.iter().zip(labels).enumerate() {
+        let it = fly::MItem::new(label).on(cfg(k));
+        items.push(if i == 0 { it.sep() } else { it });
+    }
     let head = (null_mut(), "\u{E713}", t!("Стиль", "Style").to_string(), t!("Вид панели и программ WinRust", "Look of the bar and the WinRust programs").to_string());
     fly::menu(tip_cx(&bar_layout(bar), GEAR), Some(head), items, move |i| match i18n::style::ALL.get(i) {
         Some(&s) => {
             i18n::style::set_style(s);
             place(bar);
         }
-        None => tile_windows(),
+        None if i == i18n::style::ALL.len() => tile_windows(),
+        None => {
+            if let Some(k) = KEYS.get(i - i18n::style::ALL.len() - 1) {
+                cfg_toggle(k);
+                place(bar); // auto-hide gives the reserved strip back (or takes it again); the rest only repaints
+            }
+        }
     });
 }
 
