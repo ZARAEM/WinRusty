@@ -23,6 +23,7 @@ mod fly;
 mod mixer;
 mod notes;
 mod peek;
+mod winrt;
 use windows::{
     Win32::{
         Media::Audio::{Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender},
