@@ -2831,6 +2831,13 @@ unsafe fn open_launcher() -> bool {
     true
 }
 
+/// The "Translucent bar" setting: the windows behind show through a little. Plain opacity, not the blurred acrylic of
+/// Windows 11 (that needs an undocumented composition call).
+unsafe fn glass(bar: HWND) {
+    SetWindowLongW(bar, GWL_EXSTYLE, (GetWindowLongW(bar, GWL_EXSTYLE) as u32 | WS_EX_LAYERED) as i32);
+    SetLayeredWindowAttributes(bar, 0, if cfg("glass") { 218 } else { 255 }, LWA_ALPHA);
+}
+
 /// The gear's menu: the UI style (saved for the other WinRust programs) and putting the windows side by side.
 unsafe fn style_menu() {
     let bar = BAR.load(Relaxed) as HWND;
@@ -2838,12 +2845,18 @@ unsafe fn style_menu() {
     let mut items: Vec<fly::MItem> = i18n::style::ALL.iter().zip(names).map(|(&s, n)| fly::MItem::new(n).on(s == style())).collect();
     items.push(fly::MItem::new(t!("Разложить окна плиткой", "Tile the windows")).sep());
     // the taskbar's own settings, as in Windows' "Taskbar behaviors"
-    const KEYS: [&str; 4] = ["left", "autohide", "seconds", "winnum"];
-    let labels = [t!("Кнопки слева", "Buttons on the left"), t!("Скрывать панель автоматически", "Hide the bar automatically"), t!("Секунды в часах", "Seconds in the clock"), t!("Win+цифра переключает приложения", "Win+number switches apps")];
+    const KEYS: [&str; 5] = ["left", "autohide", "seconds", "winnum", "glass"];
+    let labels = [
+        t!("Полупрозрачная панель", "Translucent bar"),
+        t!("Кнопки слева", "Buttons on the left"), t!("Скрывать панель автоматически", "Hide the bar automatically"), t!("Секунды в часах", "Seconds in the clock"), t!("Win+цифра переключает приложения", "Win+number switches apps"),
+    ];
+    let labels = [labels[1], labels[2], labels[3], labels[4], labels[0]]; // in the order of KEYS
     for (i, (k, label)) in KEYS.iter().zip(labels).enumerate() {
         let it = fly::MItem::new(label).on(cfg(k));
         items.push(if i == 0 { it.sep() } else { it });
     }
+    // the normal style in the Windows light / dark mode and accent colour (for every WinRust program)
+    items.push(fly::MItem::new(t!("Цвета Windows (светлая / тёмная тема, акцент)", "Windows colours (light / dark, accent)")).on(i18n::style::follow_system()));
     let head = (null_mut(), "\u{E713}", t!("Стиль", "Style").to_string(), t!("Вид панели и программ WinRust", "Look of the bar and the WinRust programs").to_string());
     fly::menu(tip_cx(&bar_layout(bar), GEAR), Some(head), items, move |i| match i18n::style::ALL.get(i) {
         Some(&s) => {
@@ -2852,9 +2865,12 @@ unsafe fn style_menu() {
         }
         None if i == i18n::style::ALL.len() => tile_windows(),
         None => {
-            if let Some(k) = KEYS.get(i - i18n::style::ALL.len() - 1) {
+            if i - i18n::style::ALL.len() - 1 == KEYS.len() {
+                i18n::style::set_follow_system(!i18n::style::follow_system());
+            } else if let Some(k) = KEYS.get(i - i18n::style::ALL.len() - 1) {
                 cfg_toggle(k);
                 WINNUM.store(cfg("winnum"), Relaxed);
+                glass(bar);
                 place(bar); // auto-hide gives the reserved strip back (or takes it again); the rest only repaints
             }
         }
@@ -3401,6 +3417,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_DISPLAYCHANGE => place(hwnd),
+        // WM_DPICHANGED: the display scale changed (Settings, another monitor became primary): everything is laid out
+        // from SCALE, so the bar resizes at once instead of being stretched until the next sign-in
+        0x02E0 => {
+            SCALE.set((wp & 0xffff) as f32 / 96.0);
+            place(hwnd);
+        }
         WM_DESTROY => {
             let mut ab: APPBARDATA = zeroed();
             ab.cbSize = size_of::<APPBARDATA>() as u32;
@@ -3456,7 +3478,11 @@ fn main() {
         GdiplusStartup(&mut gtok, &gin, null_mut()); // anti-aliased shapes; fill() falls back to GDI if this failed
         TB_MSG.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()));
         SH_MSG.set(RegisterWindowMessageW(wide("SHELLHOOK").as_ptr()));
-        SetProcessDPIAware();
+        // per-monitor DPI awareness (v2) where Windows has it: scale changes arrive as WM_DPICHANGED; else system-wide
+        let pm = GetProcAddress(GetModuleHandleW(wide("user32.dll").as_ptr()), b"SetProcessDpiAwarenessContext\0".as_ptr());
+        if !pm.is_some_and(|f| std::mem::transmute::<_, unsafe extern "system" fn(isize) -> i32>(f)(-4) != 0) {
+            SetProcessDPIAware();
+        }
         let dc = GetDC(null_mut());
         SCALE.set(GetDeviceCaps(dc, LOGPIXELSX as i32) as f32 / 96.0);
         ReleaseDC(null_mut(), dc);
@@ -3513,6 +3539,7 @@ fn main() {
         }
         RegisterShellHookWindow(hwnd); // window events (and flashing) come with or without explorer
         hide_taskbar();
+        glass(hwnd);
         place(hwnd);
         refresh();
         announce(); // apps already running re-add their icons to us
