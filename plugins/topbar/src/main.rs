@@ -103,6 +103,7 @@ const BAT_I: i32 = -9;
 const TAPP: i32 = -1000;
 const GEAR: i32 = -12; // the gear at the left end: the Style menu
 const GEAR_X: (i32, i32) = (6, 36); // its left edge and width, before scaling (sc() is applied where used)
+const MORE: i32 = -15; // the "…" button: the app buttons that did not fit
 const DESK: i32 = -14; // the sliver at the far end of the bar: show the desktop
 const SYS_GRP: i32 = -11; // hover key of the one pill around wifi + volume + battery (they open the same panel)
 const WIN_START: u32 = WM_APP + 10; // posted by the keyboard hook: Win key pressed alone
@@ -216,6 +217,7 @@ thread_local! {
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static GLIDE: RefCell<HashMap<isize, (f32, u64, bool)>> = RefCell::new(HashMap::new()); // where each button is drawn: (x, last update ms, moving)
     static DRAGB: Cell<Option<Drag>> = const { Cell::new(None) };
+    static STATUS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) }; // system status icons shown after the tray icons (ST_*)
     static TORDER: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) }; // the tray flyout's icons (by exe) in the order the user dragged them into
     static LAUNCH: Cell<(isize, u64)> = const { Cell::new((0, 0)) }; // pin just started (its key) and when: its icon bobs until a window shows
     static BAT_SECS: Cell<u32> = const { Cell::new(u32::MAX) }; // battery time left as Windows estimates it, u32::MAX = unknown
@@ -514,7 +516,57 @@ unsafe fn tray_drag_end(hwnd: HWND, x: i32) {
 }
 /// Bar slots of the tray: the chevron plus the icons kept on the bar.
 fn tray_count() -> usize {
-    bar_idx().len() + 1
+    bar_idx().len() + 1 + STATUS.with_borrow(|s| s.len())
+}
+
+const ST_MIC: u8 = 1; // some app is recording from the microphone
+const ST_USB: u8 = 2; // a removable drive is plugged in: "Safely remove hardware"
+
+/// The system status icon at bar hit `h` (they follow the apps' tray icons), if that is what is there.
+fn status_at(h: i32) -> Option<u8> {
+    let i = (h - TAPP - 1) as usize;
+    if h <= TAPP || h >= TAPP + 100 || i < bar_idx().len() {
+        return None;
+    }
+    STATUS.with_borrow(|s| s.get(i - bar_idx().len()).copied())
+}
+
+/// True when a subkey of the HKCU key `path` has LastUsedTimeStop = 0: Windows' own record of "in use right now"
+/// (the same store the taskbar's microphone indicator reads).
+unsafe fn reg_in_use(path: &str) -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_QWORD, RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW};
+    let mut k: HKEY = null_mut();
+    if RegOpenKeyExW(HKEY_CURRENT_USER, wide(path).as_ptr(), 0, KEY_READ, &mut k) != 0 {
+        return false;
+    }
+    let (mut found, mut i) = (false, 0u32);
+    while !found {
+        let (mut name, mut n) = ([0u16; 600], 600u32);
+        if RegEnumKeyExW(k, i, name.as_mut_ptr(), &mut n, null_mut(), null_mut(), null_mut(), null_mut()) != 0 {
+            break;
+        }
+        i += 1;
+        let (mut stop, mut sz) = (1u64, 8u32);
+        found = RegGetValueW(k, name.as_ptr(), wide("LastUsedTimeStop").as_ptr(), RRF_RT_REG_QWORD, null_mut(), &mut stop as *mut _ as *mut _, &mut sz) == 0 && stop == 0;
+    }
+    RegCloseKey(k);
+    found
+}
+
+/// Works out which status icons to show (every couple of seconds, from the refresh timer).
+unsafe fn read_status() {
+    const MIC: &str = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
+    let mut s = Vec::new();
+    if reg_in_use(MIC) || reg_in_use(&format!(r"{MIC}\NonPackaged")) {
+        s.push(ST_MIC);
+    }
+    // shortcut: drives Windows types as removable (sticks, card readers); a USB hard disk reports as a fixed disk
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    let drives = GetLogicalDrives();
+    if (0..26).any(|i| drives & (1 << i) != 0 && GetDriveTypeW(wide(&format!("{}:\\", (b'A' + i as u8) as char)).as_ptr()) == 2) {
+        s.push(ST_USB);
+    }
+    STATUS.set(s);
 }
 
 /// Indices into TAPPS of the icons only the flyout shows (everything not kept on the bar).
@@ -754,12 +806,14 @@ unsafe fn tip_text(h: i32) -> String {
         TAPP => t!("Скрытые значки", "Hidden icons").into(),
         GEAR => t!("Стиль", "Style").into(),
         DESK => t!("Показать рабочий стол", "Show desktop").into(),
+        MORE => t!("Другие приложения", "More apps").into(),
         CLOCK => {
             let mut t: SYSTEMTIME = zeroed();
             GetLocalTime(&mut t);
             let mut b = [0u16; 80];
             let n = GetDateFormatW(0x0400, 2, &t, null(), b.as_mut_ptr(), 80).max(1) as usize - 1; // DATE_LONGDATE
-            String::from_utf16_lossy(&b[..n])
+            // then the additional clocks set up in Windows (Settings > Time & language > Additional clocks)
+            extra_clocks().into_iter().fold(String::from_utf16_lossy(&b[..n]), |s, (name, time)| format!("{s}\n{name}  {time}"))
         }
         LANG => tf!("Язык ввода: {}", "Input language: {}", layout_names(layouts().1).0),
         WIFI_I => match net() {
@@ -782,6 +836,8 @@ unsafe fn tip_text(h: i32) -> String {
             }
             _ => String::new(),
         },
+        t if status_at(t) == Some(ST_MIC) => t!("Микрофон используется", "The microphone is in use").into(),
+        t if status_at(t) == Some(ST_USB) => t!("Безопасное извлечение устройства", "Safely remove hardware").into(),
         t if t > TAPP && t < TAPP + 100 => bar_idx().get((t - TAPP - 1) as usize).and_then(|&i| TAPPS.with_borrow(|t| t.get(i).map(|i| i.tip.clone()))).unwrap_or_default(),
         i if i >= 1 => {
             let (wins, lnk) = BTNS.with_borrow(|b| b.get(i as usize).map(|b| (b.wins.clone(), b.pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| wstr_of(&x.lnk))))))).unwrap_or_default();
@@ -799,6 +855,53 @@ unsafe fn tip_text(h: i32) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// (Bias, StandardBias, DaylightBias) in minutes from a time zone's TZI registry value (44 bytes; the two change-over
+/// dates follow at 12 and 28).
+fn tzi_bias(raw: &[u8; 44]) -> (i32, i32, i32) {
+    let i = |o: usize| i32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+    (i(0), i(4), i(8))
+}
+
+/// The additional clocks the user set up in Windows: (name, time now in that zone), up to two.
+unsafe fn extra_clocks() -> Vec<(String, String)> {
+    use windows_sys::Win32::System::{
+        Registry::{HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW},
+        SystemInformation::GetSystemTime,
+        Time::{SystemTimeToTzSpecificLocalTime, TIME_ZONE_INFORMATION},
+    };
+    let text = |root: HKEY, key: &str, value: &str| -> Option<String> {
+        let (mut b, mut n) = ([0u16; 256], 512u32);
+        (RegGetValueW(root, wide(key).as_ptr(), wide(value).as_ptr(), RRF_RT_REG_SZ, null_mut(), b.as_mut_ptr() as *mut _, &mut n) == 0).then(|| String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(0)]))
+    };
+    let mut out = Vec::new();
+    for i in 1..=2 {
+        let key = format!(r"Control Panel\TimeDate\AdditionalClocks\{i}");
+        let (mut on, mut n) = (0u32, 4u32);
+        if RegGetValueW(HKEY_CURRENT_USER, wide(&key).as_ptr(), wide("Enable").as_ptr(), RRF_RT_REG_DWORD, null_mut(), &mut on as *mut _ as *mut _, &mut n) != 0 || on == 0 {
+            continue;
+        }
+        let (Some(name), Some(zone)) = (text(HKEY_CURRENT_USER, &key, "DisplayName"), text(HKEY_CURRENT_USER, &key, "TzRegKeyName")) else { continue };
+        let (mut raw, mut n) = ([0u8; 44], 44u32);
+        let zkey = format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones\{zone}");
+        if RegGetValueW(HKEY_LOCAL_MACHINE, wide(&zkey).as_ptr(), wide("TZI").as_ptr(), RRF_RT_REG_BINARY, null_mut(), raw.as_mut_ptr() as *mut _, &mut n) != 0 || n != 44 {
+            continue;
+        }
+        let mut tz: TIME_ZONE_INFORMATION = zeroed();
+        (tz.Bias, tz.StandardBias, tz.DaylightBias) = tzi_bias(&raw);
+        tz.StandardDate = (raw.as_ptr().add(12) as *const SYSTEMTIME).read_unaligned();
+        tz.DaylightDate = (raw.as_ptr().add(28) as *const SYSTEMTIME).read_unaligned();
+        let (mut utc, mut local): (SYSTEMTIME, SYSTEMTIME) = (zeroed(), zeroed());
+        GetSystemTime(&mut utc);
+        if SystemTimeToTzSpecificLocalTime(&tz, &utc, &mut local) == 0 {
+            continue;
+        }
+        let mut b = [0u16; 40];
+        let n = GetTimeFormatW(0x0400, 2, &local, null(), b.as_mut_ptr(), 40).max(1) as usize - 1;
+        out.push((name, String::from_utf16_lossy(&b[..n])));
+    }
+    out
 }
 
 fn vol_tip() -> String {
@@ -1306,7 +1409,7 @@ unsafe fn drag_move(hwnd: HWND, x: i32) {
         return;
     }
     let l = bar_layout(hwnd);
-    let (cur, n) = BTNS.with_borrow(|b| (b.iter().position(|b| btn_key(b) == d.key), b.len()));
+    let (cur, n) = BTNS.with_borrow(|b| (b.iter().position(|b| btn_key(b) == d.key), b.len().min(l.shown as usize)));
     let Some(cur) = cur else {
         DRAGB.set(None); // its window closed (or the pin went away) mid-drag
         ReleaseCapture();
@@ -1636,6 +1739,9 @@ fn refresh() {
         if n % 6 == 0 {
             read_wifi();
         }
+        if n % 4 == 1 {
+            read_status();
+        }
     }
     unsafe {
         PROG.with_borrow_mut(|p| p.retain(|&w, _| IsWindow(w as HWND) != 0));
@@ -1664,6 +1770,8 @@ struct Layout {
     apps: (i32, i32),
     sys: (i32, i32),
     clock: (i32, i32),
+    shown: i32, // buttons drawn (Start included); the rest are behind the "more" button
+    more: bool,
 }
 
 fn layout(w: i32) -> Layout {
@@ -1672,7 +1780,9 @@ fn layout(w: i32) -> Layout {
     let sys = (clock.0 - sc(4) - sc(150 + if BAT.get().0 >= 0 { 66 } else { 0 }), clock.0 - sc(4));
     let apps = (sys.0 - sc(24) * tray_count() as i32, sys.0);
     let margin = (w - apps.0) + sc(8); // keep the button group centered and clear of both sides
-    let n = BTNS.with_borrow(|b| b.len()) as i32 + 1; // + the search slot
+    // too many buttons to keep them a usable width: the last ones move into a "more" menu, as on Windows 11
+    let (shown, more) = fit_buttons(BTNS.with_borrow(|b| b.len()) as i32, w - 2 * margin, gap, sc(30));
+    let n = shown + 1 + more as i32; // + the search slot and the "more" button
     let bw = (((w - 2 * margin + gap) / n.max(1)) - gap).clamp(sc(16), sc(44));
     // centered on search + Start + pins only: opening an unpinned window adds a button on the right instead of shifting Start left
     let fixed = (PINS.with_borrow(|p| p.len()) as i32 + 2).min(n);
@@ -1680,7 +1790,17 @@ fn layout(w: i32) -> Layout {
     let right_limit = w - margin - (n * (bw + gap) - gap);
     let left = sc(GEAR_X.0 + GEAR_X.1 + 6); // clear of the gear
     let x0 = if cfg("left") { left } else { ((w - (fixed * (bw + gap) - gap)) / 2).min(right_limit).max(left) }; // "Buttons on the left", as the Windows setting
-    Layout { x0, bw, gap, apps, sys, clock }
+    Layout { x0, bw, gap, apps, sys, clock, shown, more }
+}
+
+/// How many of the `total` buttons (Start included) are drawn when the row has `avail` px, each at least `minw` wide
+/// with `gap` between, next to the search button; and whether a "more" button takes the last slot for the rest.
+fn fit_buttons(total: i32, avail: i32, gap: i32, minw: i32) -> (i32, bool) {
+    if (total + 1) * (minw + gap) - gap <= avail {
+        return (total, false);
+    }
+    let slots = ((avail + gap) / (minw + gap)).max(3); // search + buttons + "more"
+    ((slots - 2).clamp(1, total), true)
 }
 
 unsafe fn hit(hwnd: HWND, x: i32) -> i32 {
@@ -1703,9 +1823,18 @@ unsafe fn hit(hwnd: HWND, x: i32) -> i32 {
     if x >= l.apps.0 {
         return TAPP + (x - l.apps.0) / sc(24);
     }
-    let n = BTNS.with_borrow(|b| b.len()) as i32 + 1;
     let (d, i) = (x - l.x0, (x - l.x0) / (l.bw + l.gap));
-    if d < 0 || d % (l.bw + l.gap) >= l.bw || i >= n { NONE } else if i == 0 { SEARCH } else { i - 1 }
+    if d < 0 || d % (l.bw + l.gap) >= l.bw {
+        NONE
+    } else if i == 0 {
+        SEARCH
+    } else if i - 1 < l.shown {
+        i - 1
+    } else if l.more && i - 1 == l.shown {
+        MORE
+    } else {
+        NONE
+    }
 }
 
 // ---------- animation ----------
@@ -2330,7 +2459,14 @@ unsafe fn paint(hwnd: HWND) {
         let slot = |i: usize| l.x0 + (i as i32 + 1) * (l.bw + l.gap);
         let held = drag.and_then(|d| btns.iter().position(|b| btn_key(b) == d.key));
         // the held button is painted last: it floats over the ones it passes
-        for i in (0..btns.len()).filter(|&i| Some(i) != held).chain(held) {
+        let held = held.filter(|&i| i < l.shown as usize);
+        if l.more {
+            let mr = RECT { left: glide(isize::MIN + 1, slot(l.shown as usize)), top, right: glide(isize::MIN + 1, slot(l.shown as usize)) + l.bw, bottom: bot };
+            glow(dc, MORE, hot == MORE, mr, pal().bg, pal().hover, sc(8));
+            SelectObject(dc, f_glyph);
+            text(dc, "\u{E712}", mr, pal().text, DT_CENTER);
+        }
+        for i in (0..btns.len().min(l.shown as usize)).filter(|&i| Some(i) != held).chain(held) {
             let b = &btns[i];
             let key = btn_key(b);
             if Some(i) == held {
@@ -2441,6 +2577,18 @@ unsafe fn paint(hwnd: HWND) {
             if !ti.icon.is_null() {
                 DrawIconEx(dc, x + sc(4), mid - sc(8), ti.icon, sc(16), sc(16), 0, null_mut(), DI_NORMAL);
             }
+        }
+    });
+
+    // system status icons after the apps' icons: microphone in use, a removable drive to eject
+    let nt = bar.len() as i32;
+    STATUS.with_borrow(|st| {
+        SelectObject(dc, f_glyph);
+        for (k, &s) in st.iter().enumerate() {
+            let i = nt + 1 + k as i32;
+            let c = cell(l.apps.0 + i * sc(24), sc(24));
+            glow(dc, TAPP + i, hot == TAPP + i, c, pal().bg, pal().hover, sc(8));
+            text(dc, if s == ST_MIC { "\u{E720}" } else { "\u{E88E}" }, c, if s == ST_MIC { pal().accent } else { pal().text }, DT_CENTER);
         }
     });
 
@@ -2924,12 +3072,20 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 if let Some(k) = bar_idx().get(slot - 1).and_then(|&i| TAPPS.with_borrow(|t| t.get(i).map(|x| x.key.clone()))) {
                     toggle_shown(&k); // back into the flyout
                 }
+            } else if let Some(st) = status_at(h) {
+                if st == ST_MIC {
+                    open(&wide("ms-settings:privacy-microphone")); // which apps may use it, and which did
+                } else {
+                    // the classic "Safely Remove Hardware" dialog: it works without Explorer
+                    let _ = Command::new("rundll32.exe").args(["shell32.dll,Control_RunDLL", "hotplug.dll"]).spawn();
+                }
             } else {
                 let ti = bar_idx().get(slot - 1).and_then(|&i| TAPPS.with_borrow(|t| t.get(i).map(|x| (x.hwnd, x.uid, x.cb, x.ver))));
                 ti.into_iter().for_each(|ti| tray_click(ti, left));
             }
         }
         DESK if left => show_desktop(),
+        MORE => more_menu(BAR.load(Relaxed) as HWND),
         0 => {
             if left {
                 fly::toggle(fly::Kind::Start);
@@ -2982,6 +3138,20 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         }
         _ => {}
     }
+}
+
+/// The "…" button: the app buttons that did not fit on the bar, as a menu; picking one is a click on that button.
+unsafe fn more_menu(hwnd: HWND) {
+    let l = bar_layout(hwnd);
+    let first = l.shown;
+    let n = BTNS.with_borrow(|b| b.len()) as i32;
+    let items: Vec<fly::MItem> = (first..n)
+        .map(|i| {
+            let icon = BTNS.with_borrow(|b| b.get(i as usize).map_or(null_mut(), |b| b.pin.and_then(|p| PINS.with_borrow(|pins| pins.get(p).map(|p| p.icon))).unwrap_or(b.icon)));
+            fly::MItem { icon, ..fly::MItem::new(tip_text(i)) }
+        })
+        .collect();
+    fly::menu(tip_cx(&l, MORE), None, items, move |k| click(first + k as i32, true, false));
 }
 
 /// The system menu of window `w` at the pointer, as Shift+right click on a taskbar button gives.
@@ -3205,6 +3375,8 @@ unsafe fn tip_cx(l: &Layout, h: i32) -> i32 {
     bar_x_w().0 + match h {
         GEAR => sc(GEAR_X.0 + GEAR_X.1 / 2),
         DESK => l.clock.1 + sc(3),
+        MORE => l.x0 + (l.shown + 1) * (l.bw + l.gap) + l.bw / 2,
+        i if i >= l.shown && l.more => l.x0 + (l.shown + 1) * (l.bw + l.gap) + l.bw / 2, // a button behind "more": that button stands for it
         SEARCH => l.x0 + l.bw / 2,
         CLOCK => (l.clock.0 + l.clock.1) / 2,
         LANG => l.sys.0 + sc(21),
@@ -3395,6 +3567,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(key) = key {
                     TDRAG.set(Some((key, h, x, false)));
                     SetCapture(hwnd);
+                } else {
+                    click(h, true, false); // a system status icon: nothing to drag
                 }
             } else if h == NONE && msg == WM_RBUTTONDOWN {
                 fly::context_menu(x); // right click on an empty spot
@@ -3648,6 +3822,18 @@ mod tests {
         assert!(pin_takes("Chrome", chrome, chrome, chrome)); // the window's identity could not be read: its exe's pin
         assert!(pin_takes("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "", "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", r"c:\windows\system32\applicationframehost.exe"));
         assert!(!pin_takes("", "", "x", "")); // nothing known on either side is not a match
+    }
+
+    #[test]
+    fn overflow_and_time_zones() {
+        use super::{fit_buttons, tzi_bias};
+        assert_eq!(fit_buttons(10, 400, 4, 30), (10, false)); // 11 slots of 34 px fit in 400
+        assert_eq!(fit_buttons(20, 400, 4, 30), (9, true)); // 11 slots: search + 9 buttons + "more"
+        assert_eq!(fit_buttons(20, 40, 4, 30), (1, true)); // however narrow: Start stays
+        let mut raw = [0u8; 44];
+        raw[..4].copy_from_slice(&(-330i32).to_le_bytes()); // India: UTC+5:30, no daylight time
+        raw[8..12].copy_from_slice(&(-60i32).to_le_bytes());
+        assert_eq!(tzi_bias(&raw), (-330, 0, -60));
     }
 
     #[test]
