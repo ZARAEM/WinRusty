@@ -25,6 +25,8 @@ thread_local! {
     static CX: Cell<i32> = const { Cell::new(0) }; // screen x the popup is centered on
     static POS: Cell<(i32, i32)> = const { Cell::new((0, 0)) }; // where it rests
     static T0: Cell<u64> = const { Cell::new(0) }; // when it started sliding in
+    static ALL: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // every window of the button; ITEMS shows a run of them
+    static OFF: Cell<usize> = const { Cell::new(0) }; // the first one shown (the wheel scrolls when they do not all fit)
     static OVER_T: Cell<u64> = const { Cell::new(0) }; // since when the pointer has been on the current preview
     static LIVE: Cell<HWND> = const { Cell::new(null_mut()) }; // the window shown on its own right now (the rest are glass)
 }
@@ -62,6 +64,11 @@ pub unsafe fn init(hi: HINSTANCE) {
     let c = wide("topbar_peek");
     RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(proc), hInstance: hi, hCursor: LoadCursorW(null_mut(), IDC_ARROW), lpszClassName: c.as_ptr(), ..zeroed() });
     WND.set(CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, c.as_ptr(), null(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hi, null()));
+}
+
+/// How many previews fit across the screen.
+unsafe fn fit_count() -> usize {
+    ((GetSystemMetrics(SM_CXSCREEN) - sc(2 * PAD + 16)) / sc(CELL_W)).max(1) as usize
 }
 
 pub fn is_open() -> bool {
@@ -114,15 +121,25 @@ pub unsafe fn show(btn: i32, cx: i32, wins: &[HWND]) {
     if w.is_null() || wins.is_empty() || fly::any_open() {
         return;
     }
-    if FOR.get() == btn && ITEMS.with_borrow(|it| it.iter().map(|i| i.win).eq(wins.iter().copied())) {
+    if FOR.get() == btn && ALL.with_borrow(|a| a.as_slice() == wins) {
         return;
     }
+    ALL.set(wins.to_vec());
+    OFF.set(0);
+    fill_from(btn, cx);
+}
+
+/// (Re)builds the row from ALL starting at OFF: as many previews as fit across the screen; the wheel moves OFF.
+unsafe fn fill_from(btn: i32, cx: i32) {
+    let w = WND.get();
+    let wins = ALL.with_borrow(|a| a.clone());
     let fresh = !is_open();
     clear();
-    // shortcut: as many as fit across the screen, the rest are reachable from the button's right-click menu
-    let max = ((GetSystemMetrics(SM_CXSCREEN) - sc(2 * PAD + 16)) / sc(CELL_W)).max(1) as usize;
+    let max = fit_count();
+    OFF.set(OFF.get().min(wins.len().saturating_sub(max)));
     let items = wins
         .iter()
+        .skip(OFF.get())
         .take(max)
         .map(|&win| {
             let mut thumb = 0isize;
@@ -315,6 +332,17 @@ unsafe extern "system" fn proc(w: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             if OVER.replace(o) != o {
                 OVER_T.set(now_ms());
                 InvalidateRect(w, null(), 0);
+            }
+        }
+        0x020A => {
+            // WM_MOUSEWHEEL: more windows than fit: scroll the row by one
+            let n = ALL.with_borrow(|a| a.len());
+            if n > fit_count() {
+                let off = if (wp >> 16) as i16 > 0 { OFF.get().saturating_sub(1) } else { (OFF.get() + 1).min(n - fit_count()) };
+                if OFF.replace(off) != off {
+                    live(None);
+                    fill_from(FOR.get(), CX.get());
+                }
             }
         }
         WM_LBUTTONUP | WM_MBUTTONUP => {
