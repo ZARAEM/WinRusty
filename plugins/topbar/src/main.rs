@@ -23,6 +23,7 @@ mod fly;
 mod mixer;
 mod notes;
 mod peek;
+mod second;
 mod winrt;
 use windows::{
     Win32::{
@@ -1086,6 +1087,7 @@ unsafe fn place(hwnd: HWND) {
     SetWindowRgn(hwnd, if style() == Style::Dock { CreateRoundRectRgn(0, 0, w + 1, bar_h() + 1, bar_h(), bar_h()) } else { null_mut() }, 1);
     SetWindowPos(hwnd, HWND_TOPMOST, x, bar_y(), w, bar_h(), SWP_NOACTIVATE);
     InvalidateRect(hwnd, null(), 0);
+    second::sync(); // the strips on the other monitors follow the style, the settings and the monitor layout
 }
 
 unsafe fn set_work_area(mut want: RECT) {
@@ -2993,12 +2995,12 @@ unsafe fn style_menu() {
     let mut items: Vec<fly::MItem> = i18n::style::ALL.iter().zip(names).map(|(&s, n)| fly::MItem::new(n).on(s == style())).collect();
     items.push(fly::MItem::new(t!("Разложить окна плиткой", "Tile the windows")).sep());
     // the taskbar's own settings, as in Windows' "Taskbar behaviors"
-    const KEYS: [&str; 5] = ["left", "autohide", "seconds", "winnum", "glass"];
+    const KEYS: [&str; 6] = ["left", "autohide", "seconds", "winnum", "glass", "onemon"];
     let labels = [
         t!("Полупрозрачная панель", "Translucent bar"),
         t!("Кнопки слева", "Buttons on the left"), t!("Скрывать панель автоматически", "Hide the bar automatically"), t!("Секунды в часах", "Seconds in the clock"), t!("Win+цифра переключает приложения", "Win+number switches apps"),
     ];
-    let labels = [labels[1], labels[2], labels[3], labels[4], labels[0]]; // in the order of KEYS
+    let labels = [labels[1], labels[2], labels[3], labels[4], labels[0], t!("Панель только на основном экране", "Bar on the main display only")]; // in the order of KEYS
     for (i, (k, label)) in KEYS.iter().zip(labels).enumerate() {
         let it = fly::MItem::new(label).on(cfg(k));
         items.push(if i == 0 { it.sep() } else { it });
@@ -3488,6 +3490,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER => {
             hide_taskbar_if_shown();
             refresh();
+            second::refresh();
             // repaint (GDI+, the costly part) only when something shown changed; every 10th tick anyway as a safety net
             let (last, quiet) = SIG.get();
             let s = view_sig();
@@ -3605,6 +3608,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if find_other("Shell_TrayWnd").is_null() {
                 set_work_area(RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) }); // ours: give the strip back
             }
+            second::close();
             show_taskbar(OLD_STATE.get());
             DestroyWindow(HOST.replace(null_mut()));
             announce(); // icons go back to explorer's tray
@@ -3667,6 +3671,7 @@ fn main() {
         fly::init(GetModuleHandleW(null()));
         peek::init(GetModuleHandleW(null()));
         notes::init(GetModuleHandleW(null()));
+        second::init(GetModuleHandleW(null()));
         thread::spawn(fly::load_apps);
         let hi = GetModuleHandleW(null());
         let class = wide("topbar");
