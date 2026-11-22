@@ -119,7 +119,84 @@ pub const PALS: [Pal; 4] = [
 ];
 
 pub fn pal() -> &'static Pal {
-    &PALS[ALL.iter().position(|&s| s == style()).unwrap_or(0)]
+    let s = style();
+    if s == Style::Normal {
+        if let Some(p) = system_pal() {
+            return p;
+        }
+    }
+    &PALS[ALL.iter().position(|&v| v == s).unwrap_or(0)]
+}
+
+// ---------- "Windows colours": the normal style in the system's light / dark mode and accent colour ----------
+
+static SYS_PAL: std::sync::atomic::AtomicPtr<Pal> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()); // null = not following
+static SYS_KEY: AtomicU32 = AtomicU32::new(u32::MAX); // what SYS_PAL was built from (accent | light << 24), MAX = nothing yet
+static SYS_AT: AtomicU64 = AtomicU64::new(0); // when the registry was last looked at
+
+fn system_file() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("system-colors.txt"))
+}
+
+/// The normal style follows the Windows light / dark mode and accent colour (the bar's gear menu switches it).
+pub fn follow_system() -> bool {
+    system_file().is_some_and(|f| f.is_file())
+}
+
+pub fn set_follow_system(on: bool) {
+    if let Some(f) = system_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap());
+        let _ = if on { std::fs::write(&f, "1") } else { std::fs::remove_file(&f) };
+    }
+    SYS_AT.store(0, Relaxed);
+    unsafe { PostMessageW(HWND_BROADCAST, msg(), 0, 0) }; // every WinRust program repaints
+}
+
+fn reg_dword(key: &str, value: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    let w = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (mut v, mut n) = (0u32, 4u32);
+    let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, w(key).as_ptr(), w(value).as_ptr(), RRF_RT_REG_DWORD, std::ptr::null_mut(), &mut v as *mut _ as *mut _, &mut n) };
+    (r == 0).then_some(v)
+}
+
+fn blend(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |s: u32| (((a >> s) & 255) as f32 + (((b >> s) & 255) as f32 - ((a >> s) & 255) as f32) * t) as u32;
+    ch(0) | ch(8) << 8 | ch(16) << 16
+}
+
+/// The palette for a system accent colour (COLORREF) in light or dark mode. On dark the accent is lightened and on
+/// light darkened a little, so text and marks in it stay readable on the panel colour.
+pub fn system_palette(accent: u32, light: bool) -> Pal {
+    if light {
+        Pal { bg: rgb(243, 243, 243), line: rgb(216, 216, 216), hover: rgb(228, 228, 228), active: rgb(212, 212, 212), accent: blend(accent, rgb(0, 0, 0), 0.15), text: rgb(26, 26, 26), dim: rgb(96, 96, 96) }
+    } else {
+        Pal { bg: rgb(28, 28, 28), line: rgb(52, 52, 52), hover: rgb(45, 45, 45), active: rgb(58, 58, 58), accent: blend(accent, rgb(255, 255, 255), 0.35), text: rgb(255, 255, 255), dim: rgb(160, 160, 160) }
+    }
+}
+
+/// The palette to use instead of the normal one, or None when the setting is off. The registry is looked at once
+/// every two seconds at most (pal() is called for every rectangle painted); a palette lives for the rest of the run
+/// (a new one is made only when the user changes the Windows colours).
+fn system_pal() -> Option<&'static Pal> {
+    let now = now_ms();
+    if now.saturating_sub(SYS_AT.load(Relaxed)) > 2000 {
+        SYS_AT.store(now, Relaxed);
+        if !follow_system() {
+            SYS_PAL.store(std::ptr::null_mut(), Relaxed);
+            SYS_KEY.store(u32::MAX, Relaxed);
+        } else {
+            // the bar and the other shell parts follow the "Windows mode" (taskbar / Start), as the real taskbar does
+            let light = reg_dword(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "SystemUsesLightTheme").unwrap_or(0) != 0;
+            let accent = reg_dword(r"Software\Microsoft\Windows\DWM", "AccentColor").map_or(PALS[0].accent, |c| c & 0x00FF_FFFF); // stored as AABBGGRR: the low 24 bits are a COLORREF
+            let key = accent | (light as u32) << 24;
+            if SYS_KEY.swap(key, Relaxed) != key {
+                SYS_PAL.store(Box::leak(Box::new(system_palette(accent, light))), Relaxed);
+            }
+        }
+    }
+    let p = SYS_PAL.load(Relaxed);
+    (!p.is_null()).then(|| unsafe { &*p })
 }
 
 /// The UI font of the current style.
@@ -130,6 +207,17 @@ pub fn ui_face() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_palettes_keep_contrast() {
+        let lum = |c: u32| (c & 255) + ((c >> 8) & 255) + ((c >> 16) & 255);
+        for accent in [rgb(0, 120, 212), rgb(255, 185, 0), rgb(0, 0, 0), rgb(255, 255, 255)] {
+            let (d, l) = (system_palette(accent, false), system_palette(accent, true));
+            assert!(lum(d.text) > lum(d.bg) + 300 && lum(l.bg) > lum(l.text) + 300); // text against the panel
+            assert!(lum(d.accent) >= 255 * 3 * 35 / 100 - 3, "a black accent is still visible on dark");
+            assert!(lum(l.accent) <= 255 * 3 * 85 / 100 + 3, "a white accent is still visible on light");
+        }
+    }
 
     #[test]
     fn names_round_trip_and_junk_is_normal() {
