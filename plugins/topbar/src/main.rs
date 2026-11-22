@@ -114,6 +114,9 @@ static DESK_HIDE: AtomicBool = AtomicBool::new(false); // the desktop in front a
 static WIN_ALONE: AtomicBool = AtomicBool::new(false);
 static BAR: AtomicIsize = AtomicIsize::new(0); // the bar window, for the hook thread
 const SNIP: u32 = WM_APP + 13; // posted by the keyboard hook: PrtSc / Win+Shift+S with no explorer to handle them
+const KB_NAV: u32 = WM_APP + 14; // posted by the keyboard hook: wp 1 / 2 previous / next button, 3 press it, 4 leave, 5 the tray flyout, 10 + n button n
+static KBNAV: AtomicBool = AtomicBool::new(false); // Win+T is walking the bar: arrows, Enter and Esc belong to it (the hook thread reads it)
+static WINNUM: AtomicBool = AtomicBool::new(false); // the "Win+number switches apps" setting, for the hook thread
 static EXPLORER_UP: AtomicBool = AtomicBool::new(true); // explorer's taskbar exists (it handles PrtSc itself then); refreshed by the bar
 
 struct Pin {
@@ -213,6 +216,7 @@ thread_local! {
     static HV: RefCell<HashMap<i32, (f32, u64)>> = RefCell::new(HashMap::new()); // hover fade per element: (0..1, last update ms)
     static GLIDE: RefCell<HashMap<isize, (f32, u64, bool)>> = RefCell::new(HashMap::new()); // where each button is drawn: (x, last update ms, moving)
     static DRAGB: Cell<Option<Drag>> = const { Cell::new(None) };
+    static TORDER: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) }; // the tray flyout's icons (by exe) in the order the user dragged them into
     static LAUNCH: Cell<(isize, u64)> = const { Cell::new((0, 0)) }; // pin just started (its key) and when: its icon bobs until a window shows
     static BAT_SECS: Cell<u32> = const { Cell::new(u32::MAX) }; // battery time left as Windows estimates it, u32::MAX = unknown
     static TCLICK: Cell<(i32, u64)> = const { Cell::new((NONE, 0)) }; // last tray icon clicked and when: a second click in time is a double click
@@ -516,7 +520,23 @@ fn tray_count() -> usize {
 /// Indices into TAPPS of the icons only the flyout shows (everything not kept on the bar).
 fn over_idx() -> Vec<usize> {
     let bar = bar_idx();
-    TAPPS.with_borrow(|t| (0..t.len()).filter(|i| !t[*i].hidden && !bar.contains(i)).collect())
+    let order = TORDER.with_borrow(|o| o.clone());
+    TAPPS.with_borrow(|t| {
+        let mut v: Vec<usize> = (0..t.len()).filter(|i| !t[*i].hidden && !bar.contains(i)).collect();
+        v.sort_by_key(|&i| order.iter().position(|k| *k == t[i].key).unwrap_or(usize::MAX)); // dragged ones first, in their order; the rest as they came
+        v
+    })
+}
+
+/// An icon was dragged inside the flyout: `key` takes the place of `onto` (the icons between shift by one). Saved.
+fn tray_order_move(key: &str, onto: &str) {
+    let mut order: Vec<String> = TAPPS.with_borrow(|t| over_idx().into_iter().map(|i| t[i].key.clone()).collect());
+    order.dedup();
+    let (Some(from), Some(to)) = (order.iter().position(|k| k == key), order.iter().position(|k| k == onto)) else { return };
+    let k = order.remove(from);
+    order.insert(to, k);
+    let _ = std::fs::write(appdata_file("topbar-tray-order.txt"), order.join("\n"));
+    TORDER.set(order);
 }
 
 fn toggle_shown(key: &str) {
@@ -614,7 +634,7 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
             });
             if tip.is_empty() {
-                tip = if over.is_empty() { "No more icons".into() } else { t!("Перетащите на панель, чтобы оставить там", "Drag onto the bar to keep it there").into() };
+                tip = if over.is_empty() { t!("Больше значков нет", "No more icons").into() } else { t!("Перетащите на панель, чтобы оставить там", "Drag onto the bar to keep it there").into() };
             }
             let mut tr = RECT { left: sc(10), top: r.bottom - sc(26), right: r.right - sc(10), bottom: r.bottom - sc(4) };
             DrawTextW(dc, wide(&tip).as_ptr(), -1, &mut tr, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
@@ -666,8 +686,11 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     toggle_shown(&key); // let go over the bar: the icon is kept there from now on
                     InvalidateRect(hwnd, null(), 0);
                     InvalidateRect(bar, null(), 0);
+                } else if let Some(onto) = over_idx().get(cell_at(lp).max(0) as usize).filter(|_| cell_at(lp) >= 0).and_then(|&k| TAPPS.with_borrow(|t| t.get(k).map(|x| x.key.clone()))).filter(|k| *k != key) {
+                    tray_order_move(&key, &onto); // let go on another icon: it takes that place
+                    InvalidateRect(hwnd, null(), 0);
                 } else if cell_at(lp) >= 0 {
-                    ShowWindow(hwnd, SW_HIDE); // a plain click (or a drag that stayed inside): the icon's own action
+                    ShowWindow(hwnd, SW_HIDE); // a plain click: the icon's own action
                     InvalidateRect(bar, null(), 0); // the bar's chevron turns with it
                     tray_click(t, true);
                 }
@@ -726,9 +749,9 @@ unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 /// Tooltip text of a bar element ("" = none).
 unsafe fn tip_text(h: i32) -> String {
     match h {
-        SEARCH => "Search".into(),
-        0 => "Start".into(),
-        TAPP => "Hidden icons".into(),
+        SEARCH => t!("Поиск", "Search").into(),
+        0 => t!("Пуск", "Start").into(),
+        TAPP => t!("Скрытые значки", "Hidden icons").into(),
         GEAR => t!("Стиль", "Style").into(),
         DESK => t!("Показать рабочий стол", "Show desktop").into(),
         CLOCK => {
@@ -755,7 +778,7 @@ unsafe fn tip_text(h: i32) -> String {
                         if h > 0 { tf!(" · осталось {h} ч {m} мин", " · {h} h {m} min left") } else { tf!(" · осталось {m} мин", " · {m} min left") }
                     }
                 };
-                format!("Battery {p}%{}{left}", if ac { " · plugged in" } else { "" })
+                tf!("Батарея {p}%{}{left}", "Battery {p}%{}{left}", if ac { t!(" · от сети", " · plugged in") } else { "" })
             }
             _ => String::new(),
         },
@@ -780,9 +803,9 @@ unsafe fn tip_text(h: i32) -> String {
 
 fn vol_tip() -> String {
     match VOL.get() {
-        (v, false) if v >= 0 => format!("Volume {v}%"),
-        (_, true) => "Muted".into(),
-        _ => "Volume".into(),
+        (v, false) if v >= 0 => tf!("Громкость {v}%", "Volume {v}%"),
+        (_, true) => t!("Звук выключен", "Muted").into(),
+        _ => t!("Громкость", "Volume").into(),
     }
 }
 
@@ -1970,6 +1993,37 @@ unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             }
             let down = w == WM_KEYDOWN as usize || w == WM_SYSKEYDOWN as usize;
             let bar = BAR.load(Relaxed) as HWND;
+            // the taskbar's keyboard: Win+T walks the app buttons (then arrows move, Enter / Space press, Esc leaves),
+            // Win+B opens the hidden tray icons, and, when the setting is on, Win+1..9 press the first nine buttons
+            let vk = k.vkCode as u16;
+            if KBNAV.load(Relaxed) && down && ![VK_LWIN, VK_RWIN, VK_SHIFT, VK_LSHIFT, VK_RSHIFT].contains(&vk) && vk != b'T' as u16 {
+                let what = match vk {
+                    VK_LEFT => 1,
+                    VK_RIGHT => 2,
+                    VK_RETURN | VK_SPACE => 3,
+                    _ => 4,
+                };
+                PostMessageW(bar, KB_NAV, what, 0);
+                if vk == VK_LEFT || vk == VK_RIGHT || vk == VK_RETURN || vk == VK_SPACE || vk == VK_ESCAPE {
+                    return 1;
+                } // any other key ends the walk and goes where it was going
+            }
+            if down && (GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0) {
+                let what = match vk {
+                    v if v == b'T' as u16 => Some(if GetAsyncKeyState(VK_SHIFT as i32) < 0 { 1 } else { 2 }),
+                    v if v == b'B' as u16 => Some(5),
+                    v if (b'1' as u16..=b'9' as u16).contains(&v) && WINNUM.load(Relaxed) => Some(10 + (v - b'0' as u16) as usize),
+                    _ => None,
+                };
+                if let Some(what) = what {
+                    WIN_ALONE.store(false, Relaxed); // a shortcut, not a Start press
+                    if vk == b'T' as u16 {
+                        KBNAV.store(true, Relaxed);
+                    }
+                    PostMessageW(bar, KB_NAV, what, 0);
+                    return 1;
+                }
+            }
             // Alt+Tab: our own switcher. Without explorer Windows only flips to the next window blindly, and a fullscreen
             // game often takes the focus straight back.
             if k.vkCode == VK_TAB as u32 && k.flags & LLKHF_ALTDOWN != 0 && GetAsyncKeyState(VK_CONTROL as i32) >= 0 {
@@ -2784,8 +2838,8 @@ unsafe fn style_menu() {
     let mut items: Vec<fly::MItem> = i18n::style::ALL.iter().zip(names).map(|(&s, n)| fly::MItem::new(n).on(s == style())).collect();
     items.push(fly::MItem::new(t!("Разложить окна плиткой", "Tile the windows")).sep());
     // the taskbar's own settings, as in Windows' "Taskbar behaviors"
-    const KEYS: [&str; 3] = ["left", "autohide", "seconds"];
-    let labels = [t!("Кнопки слева", "Buttons on the left"), t!("Скрывать панель автоматически", "Hide the bar automatically"), t!("Секунды в часах", "Seconds in the clock")];
+    const KEYS: [&str; 4] = ["left", "autohide", "seconds", "winnum"];
+    let labels = [t!("Кнопки слева", "Buttons on the left"), t!("Скрывать панель автоматически", "Hide the bar automatically"), t!("Секунды в часах", "Seconds in the clock"), t!("Win+цифра переключает приложения", "Win+number switches apps")];
     for (i, (k, label)) in KEYS.iter().zip(labels).enumerate() {
         let it = fly::MItem::new(label).on(cfg(k));
         items.push(if i == 0 { it.sep() } else { it });
@@ -2800,6 +2854,7 @@ unsafe fn style_menu() {
         None => {
             if let Some(k) = KEYS.get(i - i18n::style::ALL.len() - 1) {
                 cfg_toggle(k);
+                WINNUM.store(cfg("winnum"), Relaxed);
                 place(bar); // auto-hide gives the reserved strip back (or takes it again); the rest only repaints
             }
         }
@@ -3081,6 +3136,44 @@ unsafe fn spring(hwnd: HWND) {
     }
 }
 
+/// The keyboard hook's taskbar keys (see KB_NAV).
+unsafe fn kb_nav(hwnd: HWND, what: usize) {
+    thread_local!(static SEL: Cell<i32> = const { Cell::new(0) });
+    let n = BTNS.with_borrow(|b| b.len()) as i32;
+    match what {
+        1 | 2 if n > 1 => {
+            // from the button under the pointer or the last one walked to; wraps around, never onto Start
+            let cur = if SEL.get() >= 1 && SEL.get() < n { SEL.get() } else if what == 2 { 0 } else { 1 };
+            let next = if what == 2 { cur % (n - 1) + 1 } else { (cur + n - 3) % (n - 1) + 1 };
+            SEL.set(next);
+            HOT.set(next);
+            hide_tip(hwnd);
+            if !peek_for(hwnd, next) {
+                peek::hide();
+                show_tip(tip_text(next), tip_cx(&bar_layout(hwnd), next)); // a pin that is not running: its name
+            }
+        }
+        3 | 4 => {
+            let sel = SEL.replace(0);
+            KBNAV.store(false, Relaxed);
+            HOT.set(NONE);
+            hide_tip(hwnd);
+            peek::hide();
+            if what == 3 && sel >= 1 && sel < n {
+                press(sel);
+                click(sel, true, false);
+            }
+        }
+        5 => fly_toggle(),
+        w if w > 10 && ((w - 10) as i32) < n => {
+            press((w - 10) as i32);
+            click((w - 10) as i32, true, false);
+        }
+        _ => {}
+    }
+    InvalidateRect(hwnd, null(), 0);
+}
+
 /// Shows the window previews of bar button `h`. false = it has no open windows (or is not an app button at all).
 unsafe fn peek_for(hwnd: HWND, h: i32) -> bool {
     let wins = if h >= 1 { BTNS.with_borrow(|b| b.get(h as usize).map(|b| b.wins.clone())).unwrap_or_default() } else { vec![] };
@@ -3198,6 +3291,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER if wp == 5 => bar_step(hwnd),
         WIN_START => fly::toggle(fly::Kind::Start),
+        KB_NAV => kb_nav(hwnd, wp),
         ALT_TAB => alt_tab(wp == 1),
         ALT_UP => alt_done(wp == 1),
         SNIP if wp == 1 => screenshot_notice(hwnd),
@@ -3367,6 +3461,8 @@ fn main() {
         SCALE.set(GetDeviceCaps(dc, LOGPIXELSX as i32) as f32 / 96.0);
         ReleaseDC(null_mut(), dc);
         SHOWN.set(std::fs::read_to_string(appdata_file("topbar-tray.txt")).ok().map(|s| s.lines().map(str::to_string).collect()));
+        WINNUM.store(cfg("winnum"), Relaxed);
+        TORDER.set(std::fs::read_to_string(appdata_file("topbar-tray-order.txt")).unwrap_or_default().lines().map(str::to_string).collect());
         load_pins();
         fly::init(GetModuleHandleW(null()));
         peek::init(GetModuleHandleW(null()));
